@@ -109,19 +109,17 @@ struct Server {
 
 #define SERVER_COUNT 5
 
-#define ELECTION_TIMEOUT 5.0f
+#define ELECTION_TIMEOUT 10.0f
 
 AppendEntriesResponse server_send_append_entries(Server& server, AppendEntries append_entries) {
-    // TODO: we should really process the message indirectly
     assert(server.state != ServerState::Leader);
 
     if (server.state == ServerState::Candidate) {
         server.state = ServerState::Follower;
     }
+    server.voted_for = 0;
     server.election_timer = 1.0f + ELECTION_TIMEOUT * (float)rand() / (float)RAND_MAX;
 
-
-    server.election_timer = 1.0f + ELECTION_TIMEOUT * (float)rand() / (float)RAND_MAX;
     if (append_entries.term < server.term) {
         return AppendEntriesResponse { server.term, false };
     }
@@ -171,6 +169,10 @@ void server_send_rpc(Server& server, RPC rpc) {
 void answer_rpc(Server& server, RPC rpc) {
     switch (rpc.type) {
         case RPCType::RequestVote: {
+            if (server.term < rpc.request_vote.term) {
+                server.term = rpc.request_vote.term;
+                server.state = ServerState::Follower;
+            }
             RequestVoteResponse request_vote_response = server_send_request_vote(server, rpc.request_vote);
             auto s = std::find_if(begin(server.others), end(server.others), [rv = rpc.request_vote](Server* s) {
                 return s->id == rv.candidate_id;
@@ -181,6 +183,10 @@ void answer_rpc(Server& server, RPC rpc) {
             server_send_rpc(**s, response);
         } break;
         case RPCType::AppendEntries: {
+            if (server.term < rpc.append_entries.term) {
+                server.term = rpc.append_entries.term;
+                server.state = ServerState::Follower;
+            }
             AppendEntriesResponse append_entries_response = server_send_append_entries(server, rpc.append_entries);
             RPC response;
             response.type = RPCType::AppendEntriesResponse;
@@ -193,6 +199,11 @@ void answer_rpc(Server& server, RPC rpc) {
         } break;
         case RPCType::RequestVoteResponse: {
             assert(server.state == ServerState::Candidate || server.state == ServerState::Leader);
+            if (server.term < rpc.request_vote_response.term) {
+                server.term = rpc.request_vote_response.term;
+                server.state = ServerState::Follower;
+            }
+
             RequestVoteResponse request_vote_response = rpc.request_vote_response;
             if (request_vote_response.vote_granted) {
                 assert(request_vote_response.term <= server.term);
@@ -201,10 +212,15 @@ void answer_rpc(Server& server, RPC rpc) {
             if (server.vote_count * 2 > SERVER_COUNT) {
                 // majority of votes, become the leader
                 server.state = ServerState::Leader;
+                server.vote_count = 0;
                 server.heartbeat_timer = 0.0f;
             }
         } break;
         case RPCType::AppendEntriesResponse: {
+            if (server.term < rpc.append_entries_response.term) {
+                server.term = rpc.append_entries_response.term;
+                server.state = ServerState::Follower;
+            }
             assert(server.state == ServerState::Leader);
         } break;
         default:
@@ -214,6 +230,11 @@ void answer_rpc(Server& server, RPC rpc) {
 
 void update_leader(Server& server, float dt) {
     server.heartbeat_timer -= dt;
+
+    for (RPC rpc: server.messages) {
+        answer_rpc(server, rpc);
+    }
+    server.messages.clear();
 
     if (server.heartbeat_timer <= 0.0f) {
         server.heartbeat_timer = 3.0f * (float)rand() / (float)RAND_MAX;
@@ -236,10 +257,15 @@ void update_leader(Server& server, float dt) {
 }
 
 void update_candidate(Server& server, float dt) {
+    server.election_timer -= dt;
     for (RPC rpc: server.messages) {
         answer_rpc(server, rpc);
     }
     server.messages.clear();
+
+    if (server.election_timer <= 0.0f) {
+        server.state = ServerState::Follower;
+    }
 }
 
 void update_follower(Server& server, float dt) {
@@ -255,6 +281,7 @@ void update_follower(Server& server, float dt) {
         server.term++;
         server.voted_for = server.id;
         server.state = ServerState::Candidate;
+        server.election_timer = 1.0f + ELECTION_TIMEOUT * (float)rand() / (float)RAND_MAX;
         for (Server* other: server.others) {
             server_send_rpc(*other, RPC {
                 RPCType::RequestVote,
