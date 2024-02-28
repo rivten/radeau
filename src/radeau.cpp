@@ -2,6 +2,8 @@
 #include <vector>
 #include <cassert>
 #include <cstdlib>
+#include <algorithm>
+#include <list>
 
 #include <raylib.h>
 
@@ -38,9 +40,10 @@ enum class ServerState {
 };
 
 enum class RPCType {
-    Failure,
     RequestVote,
+    RequestVoteResponse,
     AppendEntries,
+    AppendEntriesResponse,
 };
 
 struct RequestVote {
@@ -74,14 +77,8 @@ struct RPC {
     RPCType type;
     union {
         RequestVote request_vote;
-        AppendEntries append_entries;
-    };
-};
-
-struct RPCResponse {
-    RPCType type;
-    union {
         RequestVoteResponse request_vote_response;
+        AppendEntries append_entries;
         AppendEntriesResponse append_entries_response;
     };
 };
@@ -106,6 +103,8 @@ struct Server {
 
     // simulation state -- not part of raft
     float heartbeat_timer;
+    std::list<RPC> messages;
+    int vote_count = 0;
 };
 
 #define SERVER_COUNT 5
@@ -165,29 +164,36 @@ RequestVoteResponse server_send_request_vote(Server& server, RequestVote request
     return response;
 }
 
-RPCResponse server_send_rpc(Server& server, RPC rpc) {
+void server_send_rpc(Server& server, RPC rpc) {
+    server.messages.push_back(rpc);
+}
+
+void answer_rpc(Server& server, RPC rpc) {
     switch (rpc.type) {
         case RPCType::RequestVote: {
-            RequestVoteResponse response = server_send_request_vote(server, rpc.request_vote);
-            return RPCResponse {
-                RPCType::RequestVote,
-                response,
-            };
+            RequestVoteResponse request_vote_response = server_send_request_vote(server, rpc.request_vote);
+            auto s = std::find_if(begin(server.others), end(server.others), [rv = rpc.request_vote](Server* s) {
+                return s->id == rv.candidate_id;
+            });
+            RPC response;
+            response.type = RPCType::RequestVoteResponse;
+            response.request_vote_response = request_vote_response;
+            server_send_rpc(**s, response);
         } break;
         case RPCType::AppendEntries: {
             AppendEntriesResponse append_entries_response = server_send_append_entries(server, rpc.append_entries);
-            RPCResponse response;
-            response.type = RPCType::RequestVote;
+            RPC response;
+            response.type = RPCType::AppendEntriesResponse;
             response.append_entries_response = append_entries_response;
-            return response;
+            auto s = std::find_if(begin(server.others), end(server.others), [rv = rpc.request_vote](Server* s) {
+                return s->id == rv.candidate_id;
+            });
+            server_send_rpc(**s, response);
 
         } break;
         default:
             assert(false);
     }
-    return RPCResponse {
-        RPCType::Failure,
-    };
 }
 
 void update_leader(Server& server, float dt) {
@@ -207,7 +213,7 @@ void update_leader(Server& server, float dt) {
             RPC rpc;
             rpc.type = RPCType::AppendEntries;
             rpc.append_entries = append_entries;
-            RPCResponse response = server_send_rpc(*other, rpc);
+            server_send_rpc(*other, rpc);
         }
     }
 }
@@ -222,23 +228,22 @@ void update_follower(Server& server, float dt) {
         server.term++;
         server.voted_for = server.id;
         server.state = ServerState::Candidate;
-        int vote_count = 1;
         for (Server* other: server.others) {
-            RPCResponse response = server_send_rpc(*other, RPC {
+            server_send_rpc(*other, RPC {
                 RPCType::RequestVote,
                 RequestVote {server.term, server.id, server.log.size() == 0 ? 0 : server.log.back().index, server.log.size() == 0 ? 0 : server.log.back().term},
             });
-            assert(response.type == RPCType::RequestVote);
-            RequestVoteResponse request_vote_response = response.request_vote_response;
-            if (request_vote_response.vote_granted) {
-                assert(request_vote_response.term <= server.term);
-                vote_count++;
-            }
-            if (vote_count * 2 > SERVER_COUNT) {
-                // majority of votes, become the leader
-                server.state = ServerState::Leader;
-                server.heartbeat_timer = 0.0f;
-            }
+            //assert(response.type == RPCType::RequestVote);
+            //RequestVoteResponse request_vote_response = response.request_vote_response;
+            //if (request_vote_response.vote_granted) {
+            //    assert(request_vote_response.term <= server.term);
+            //    vote_count++;
+            //}
+            //if (vote_count * 2 > SERVER_COUNT) {
+            //    // majority of votes, become the leader
+            //    server.state = ServerState::Leader;
+            //    server.heartbeat_timer = 0.0f;
+            //}
         }
     }
 }
