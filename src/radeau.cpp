@@ -1,5 +1,6 @@
 #include <iostream>
 #include <vector>
+#include <cassert>
 
 enum class ServerState {
     Leader,
@@ -14,7 +15,7 @@ enum class RPCType {
 struct RequestVote {
     int term;
     int candidate_id;
-    int last_log_index;
+    size_t last_log_index;
     int last_log_term;
 };
 
@@ -37,16 +38,21 @@ struct RPCResponse {
     };
 };
 
+struct Log {
+    int term;
+    std::string log;
+};
+
 struct Server {
-    int id;
+    int id;  // ids start at 0
     std::vector<Server*> others;
     ServerState state {ServerState::Follower};
     float last_heartbeat_from_leader {0.0f};
     
     // persistent storage
     int term {0};
-    int voted_for;
-    std::vector<std::string> log;
+    int voted_for; // 0 indicates no vote
+    std::vector<Log> log;
 
     // volatile state
 
@@ -60,12 +66,20 @@ struct Server {
 RPCResponse server_send_rpc(Server& server, RPC rpc) {
     switch (rpc.type) {
         case RPCType::RequestVote: {
+            RequestVoteResponse response {};
+            if (server.term > rpc.request_vote.term) {
+                response.term = server.term;
+                response.vote_granted = false;
+            } else if ((server.voted_for == 0 || server.voted_for == rpc.request_vote.candidate_id) && (rpc.request_vote.last_log_term >= server.log.back().term) && (rpc.request_vote.last_log_index >= (server.log.size() + 1))) {
+                response.term = server.term;
+                response.vote_granted = true;
+            } else {
+                response.term = server.term;
+                response.vote_granted = false;
+            }
             return RPCResponse {
                 RPCType::RequestVote,
-                RequestVoteResponse {
-                    server.term,
-                    true
-                }
+                response,
             };
         } break;
     }
@@ -86,11 +100,22 @@ void update_server(Server& server, float dt) {
         server.term++;
         server.voted_for = server.id;
         server.state = ServerState::Candidate;
+        int vote_count = 1;
         for (Server* other: server.others) {
-            server_send_rpc(*other, RPC {
+            RPCResponse response = server_send_rpc(*other, RPC {
                 RPCType::RequestVote,
-                RequestVote {server.term, server.id, 0, 0},
+                RequestVote {server.term, server.id, server.log.size() + 1, server.log.back().term},
             });
+            assert(response.type == RPCType::RequestVote);
+            RequestVoteResponse request_vote_response = response.request_vote_response;
+            if (request_vote_response.vote_granted) {
+                assert(request_vote_response.term <= server.term);
+                vote_count++;
+            }
+            if (vote_count * 2 >= SERVER_COUNT) {
+                // majority of votes, become the leader
+                server.state = ServerState::Leader;
+            }
         }
     }
 }
@@ -99,7 +124,7 @@ int main() {
     std::vector<Server> servers(SERVER_COUNT);
 
     for (int i = 0; i < SERVER_COUNT; ++i) {
-        servers[i].id = i;
+        servers[i].id = i + 1; // ids start at one
         for (int j = 0; j < SERVER_COUNT; ++j) {
             if (i != j) {
                 servers[i].others.push_back(&servers[j]);
