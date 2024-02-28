@@ -104,7 +104,7 @@ struct Server {
     // simulation state -- not part of raft
     float heartbeat_timer;
     std::list<RPC> messages;
-    int vote_count = 0;
+    int vote_count {0};
 };
 
 #define SERVER_COUNT 5
@@ -191,6 +191,22 @@ void answer_rpc(Server& server, RPC rpc) {
             server_send_rpc(**s, response);
 
         } break;
+        case RPCType::RequestVoteResponse: {
+            assert(server.state == ServerState::Candidate || server.state == ServerState::Leader);
+            RequestVoteResponse request_vote_response = rpc.request_vote_response;
+            if (request_vote_response.vote_granted) {
+                assert(request_vote_response.term <= server.term);
+                server.vote_count++;
+            }
+            if (server.vote_count * 2 > SERVER_COUNT) {
+                // majority of votes, become the leader
+                server.state = ServerState::Leader;
+                server.heartbeat_timer = 0.0f;
+            }
+        } break;
+        case RPCType::AppendEntriesResponse: {
+            assert(server.state == ServerState::Leader);
+        } break;
         default:
             assert(false);
     }
@@ -198,6 +214,7 @@ void answer_rpc(Server& server, RPC rpc) {
 
 void update_leader(Server& server, float dt) {
     server.heartbeat_timer -= dt;
+
     if (server.heartbeat_timer <= 0.0f) {
         server.heartbeat_timer = 3.0f * (float)rand() / (float)RAND_MAX;
         for (Server* other: server.others) {
@@ -219,10 +236,20 @@ void update_leader(Server& server, float dt) {
 }
 
 void update_candidate(Server& server, float dt) {
+    for (RPC rpc: server.messages) {
+        answer_rpc(server, rpc);
+    }
+    server.messages.clear();
 }
 
 void update_follower(Server& server, float dt) {
     server.election_timer -= dt;
+
+    for (RPC rpc: server.messages) {
+        answer_rpc(server, rpc);
+    }
+    server.messages.clear();
+    
     if (server.election_timer <= 0.0f) {
         // start the election
         server.term++;
@@ -233,17 +260,6 @@ void update_follower(Server& server, float dt) {
                 RPCType::RequestVote,
                 RequestVote {server.term, server.id, server.log.size() == 0 ? 0 : server.log.back().index, server.log.size() == 0 ? 0 : server.log.back().term},
             });
-            //assert(response.type == RPCType::RequestVote);
-            //RequestVoteResponse request_vote_response = response.request_vote_response;
-            //if (request_vote_response.vote_granted) {
-            //    assert(request_vote_response.term <= server.term);
-            //    vote_count++;
-            //}
-            //if (vote_count * 2 > SERVER_COUNT) {
-            //    // majority of votes, become the leader
-            //    server.state = ServerState::Leader;
-            //    server.heartbeat_timer = 0.0f;
-            //}
         }
     }
 }
