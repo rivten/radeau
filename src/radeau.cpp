@@ -27,6 +27,7 @@
 
 struct Log {
     int term;
+    size_t index;
     std::string log;
 };
 
@@ -59,8 +60,9 @@ struct AppendEntries {
     int leader_id;
     size_t prev_log_index;
     int prev_log_term;
-    const std::vector<Log>& entries;
-    int leader_commit_index;
+    Log* entries;
+    size_t entry_count;
+    size_t leader_commit_index;
 };
 
 struct AppendEntriesResponse {
@@ -100,6 +102,10 @@ struct Server {
     size_t last_applied;
 
     // volatide leader-only state
+
+
+    // simulation state -- not part of raft
+    float heartbeat_timer;
 };
 
 #define SERVER_COUNT 5
@@ -107,6 +113,16 @@ struct Server {
 #define ELECTION_TIMEOUT 5.0f
 
 AppendEntriesResponse server_send_append_entries(Server& server, AppendEntries append_entries) {
+    // TODO: we should really process the message indirectly
+    assert(server.state != ServerState::Leader);
+
+    if (server.state == ServerState::Candidate) {
+        server.state = ServerState::Follower;
+    }
+    server.election_timer = 1.0f + ELECTION_TIMEOUT * (float)rand() / (float)RAND_MAX;
+
+
+    server.election_timer = 1.0f + ELECTION_TIMEOUT * (float)rand() / (float)RAND_MAX;
     if (append_entries.term < server.term) {
         return AppendEntriesResponse { server.term, false };
     }
@@ -120,8 +136,15 @@ AppendEntriesResponse server_send_append_entries(Server& server, AppendEntries a
     if (log.term != append_entries.term) {
         server.log.resize(append_entries.prev_log_index - 1); // not sure about - 1 here
     }
-    for (const Log& log: append_entries.entries) {
-        server.log.push_back(log);
+    for (size_t i = 0; i < append_entries.entry_count; ++i) {
+        server.log.push_back(append_entries.entries[i]);
+    }
+    if (append_entries.leader_commit_index > server.commit_index) {
+        if (append_entries.entry_count == 0) {
+            server.commit_index = append_entries.leader_commit_index;
+        } else {
+            server.commit_index = std::min(append_entries.leader_commit_index, append_entries.entries[append_entries.entry_count - 1].index);
+        }
     }
     return AppendEntriesResponse{ server.term, true };
 }
@@ -131,7 +154,7 @@ RequestVoteResponse server_send_request_vote(Server& server, RequestVote request
     if (server.term > request_vote.term) {
         response.term = server.term;
         response.vote_granted = false;
-    } else if ((server.voted_for == 0 || server.voted_for == request_vote.candidate_id) && (server.log.size() == 0 || request_vote.last_log_term >= server.log.back().term) && (server.log.size() == 0 || request_vote.last_log_index >= (server.log.size() + 1))) {
+    } else if ((server.voted_for == 0 || server.voted_for == request_vote.candidate_id) && (server.log.size() == 0 || request_vote.last_log_term >= server.log.back().term) && (server.log.size() == 0 || request_vote.last_log_index >= server.log.back().index)) {
         response.term = server.term;
         server.voted_for = request_vote.candidate_id;
         response.vote_granted = true;
@@ -168,6 +191,25 @@ RPCResponse server_send_rpc(Server& server, RPC rpc) {
 }
 
 void update_leader(Server& server, float dt) {
+    server.heartbeat_timer -= dt;
+    if (server.heartbeat_timer <= 0.0f) {
+        server.heartbeat_timer = 3.0f * (float)rand() / (float)RAND_MAX;
+        for (Server* other: server.others) {
+            AppendEntries append_entries = AppendEntries {
+                server.term,
+                server.id,
+                server.log.size() == 0 ? 0 : server.log.back().index,
+                server.log.size() == 0 ? 0 : server.log.back().term,
+                nullptr,
+                0,
+                server.commit_index,
+            };
+            RPC rpc;
+            rpc.type = RPCType::AppendEntries;
+            rpc.append_entries = append_entries;
+            RPCResponse response = server_send_rpc(*other, rpc);
+        }
+    }
 }
 
 void update_candidate(Server& server, float dt) {
@@ -184,7 +226,7 @@ void update_follower(Server& server, float dt) {
         for (Server* other: server.others) {
             RPCResponse response = server_send_rpc(*other, RPC {
                 RPCType::RequestVote,
-                RequestVote {server.term, server.id, server.log.size() ? server.log.size() + 1 : 0, server.log.size() ? server.log.back().term : 0},
+                RequestVote {server.term, server.id, server.log.size() == 0 ? 0 : server.log.back().index, server.log.size() == 0 ? 0 : server.log.back().term},
             });
             assert(response.type == RPCType::RequestVote);
             RequestVoteResponse request_vote_response = response.request_vote_response;
@@ -195,6 +237,7 @@ void update_follower(Server& server, float dt) {
             if (vote_count * 2 > SERVER_COUNT) {
                 // majority of votes, become the leader
                 server.state = ServerState::Leader;
+                server.heartbeat_timer = 0.0f;
             }
         }
     }
@@ -237,7 +280,7 @@ int main() {
 
     for (int i = 0; i < SERVER_COUNT; ++i) {
         servers[i].id = i + 1; // ids start at one
-        servers[i].election_timer = ELECTION_TIMEOUT * (float)rand() / (float)RAND_MAX;
+        servers[i].election_timer = 1.0f + ELECTION_TIMEOUT * (float)rand() / (float)RAND_MAX;
         for (int j = 0; j < SERVER_COUNT; ++j) {
             if (i != j) {
                 servers[i].others.push_back(&servers[j]);
@@ -266,6 +309,7 @@ int main() {
             DrawText(TextFormat("Commit Index: %d", server.commit_index), server_x, 160, 15, SRCERY_BRIGHTWHITE);
             DrawText(TextFormat("Last Applied: %d", server.last_applied), server_x, 180, 15, SRCERY_BRIGHTWHITE);
             DrawText(TextFormat("Election Timer: %.2f", server.election_timer), server_x, 200, 15, SRCERY_BRIGHTWHITE);
+            DrawText(TextFormat("Heartbeat Timer: %.2f", server.heartbeat_timer), server_x, 220, 15, SRCERY_BRIGHTWHITE);
         }
 
         EndDrawing();
