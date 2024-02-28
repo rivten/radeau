@@ -27,6 +27,8 @@
 #define WINDOW_WIDTH 1000
 #define WINDOW_HEIGHT 600
 
+#define LOG_MAX_SIZE 1024*1024
+
 struct Log {
     int term;
     size_t index;
@@ -88,7 +90,7 @@ struct Server {
     std::vector<Server*> others;
     ServerState state {ServerState::Follower};
     float election_timer {0.0f};
-    
+
     // persistent storage
     int term {0};
     int voted_for; // 0 indicates no vote
@@ -99,7 +101,8 @@ struct Server {
     size_t last_applied;
 
     // volatide leader-only state
-
+    std::vector<size_t> next_index; // also contains oneself, but ignored
+    std::vector<size_t> match_index; // also contains oneself, but ignored
 
     // simulation state -- not part of raft
     float heartbeat_timer;
@@ -123,17 +126,24 @@ AppendEntriesResponse server_send_append_entries(Server& server, AppendEntries a
     if (append_entries.term < server.term) {
         return AppendEntriesResponse { server.term, false };
     }
-    if (server.log.size() <= append_entries.prev_log_index - 1) {
-        return AppendEntriesResponse { server.term, false };
-    }
-    Log log = server.log[append_entries.prev_log_index - 1];
-    if (log.term != append_entries.prev_log_term) {
-        return AppendEntriesResponse { server.term, false };
-    }
-    if (log.term != append_entries.term) {
-        server.log.resize(append_entries.prev_log_index - 1); // not sure about - 1 here
+    //if (server.log.size() <= append_entries.prev_log_index - 1) {
+    //    return AppendEntriesResponse { server.term, false };
+    //}
+    //Log log = server.log[append_entries.prev_log_index - 1];
+    //if (log.term != append_entries.prev_log_term) {
+    //    return AppendEntriesResponse { server.term, false };
+    //}
+    if (server.log.size() > append_entries.prev_log_index - 1) {
+        Log log = server.log[append_entries.prev_log_index - 1];
+        if (log.term != append_entries.prev_log_term) {
+            return AppendEntriesResponse {server.term, false};
+        }
+        if (log.term != append_entries.term) {
+            server.log.resize(append_entries.prev_log_index - 1); // not sure about - 1 here
+        }
     }
     for (size_t i = 0; i < append_entries.entry_count; ++i) {
+        assert(server.log.size() < LOG_MAX_SIZE);
         server.log.push_back(append_entries.entries[i]);
     }
     if (append_entries.leader_commit_index > server.commit_index) {
@@ -187,6 +197,11 @@ void answer_rpc(Server& server, RPC rpc) {
                 server.term = rpc.append_entries.term;
                 server.state = ServerState::Follower;
             }
+
+            if (server.state == ServerState::Candidate) {
+                server.state = ServerState::Follower;
+            }
+
             AppendEntriesResponse append_entries_response = server_send_append_entries(server, rpc.append_entries);
             RPC response;
             response.type = RPCType::AppendEntriesResponse;
@@ -214,6 +229,10 @@ void answer_rpc(Server& server, RPC rpc) {
                 server.state = ServerState::Leader;
                 server.vote_count = 0;
                 server.heartbeat_timer = 0.0f;
+                for (int i = 0; i < SERVER_COUNT; ++i) {
+                    server.next_index[i] = server.log.size() == 0 ? 1 : server.log.back().index + 1;
+                    server.match_index[i] = 0;
+                }
             }
         } break;
         case RPCType::AppendEntriesResponse: {
@@ -254,6 +273,29 @@ void update_leader(Server& server, float dt) {
             server_send_rpc(*other, rpc);
         }
     }
+
+    if (server.log.size() != 0) {
+        size_t last_log_index = server.log.back().index;
+        for (Server* other: server.others) {
+            size_t next_index = server.next_index[other->id];
+            size_t match_index = server.match_index[other->id];
+            if (last_log_index >= next_index) {
+                AppendEntries append_entries = AppendEntries {
+                    server.term,
+                    server.id,
+                    server.log.back().index,
+                    server.log.back().term,
+                    &server.log[next_index],
+                    last_log_index - next_index + 1,
+                    server.commit_index,
+                };
+                RPC rpc;
+                rpc.type = RPCType::AppendEntries;
+                rpc.append_entries = append_entries;
+                server_send_rpc(*other, rpc);
+            }
+        }
+    }
 }
 
 void update_candidate(Server& server, float dt) {
@@ -275,7 +317,7 @@ void update_follower(Server& server, float dt) {
         answer_rpc(server, rpc);
     }
     server.messages.clear();
-    
+
     if (server.election_timer <= 0.0f) {
         // start the election
         server.term++;
@@ -292,6 +334,10 @@ void update_follower(Server& server, float dt) {
 }
 
 void update_server(Server& server, float dt) {
+    if(server.commit_index > server.last_applied) {
+        server.last_applied++;
+        // apply server.log[last_applied]
+    }
     switch (server.state) {
         case ServerState::Leader: {
             update_leader(server, dt);
@@ -323,23 +369,53 @@ static Color server_draw_color(ServerState server_state) {
     }
 }
 
+#define PUSH_LOG_TIMER 10.0f
+
+static void server_push_log(Server& server, std::string log) {
+    assert(server.state == ServerState::Leader);
+    assert(server.log.size() < LOG_MAX_SIZE);
+    server.log.push_back(Log {
+        server.term,
+        server.log.size() == 0 ? 1 : server.log.back().index + 1,
+        log,
+    });
+}
+
 int main() {
     std::vector<Server> servers(SERVER_COUNT);
 
     for (int i = 0; i < SERVER_COUNT; ++i) {
         servers[i].id = i + 1; // ids start at one
         servers[i].election_timer = 1.0f + ELECTION_TIMEOUT * (float)rand() / (float)RAND_MAX;
+        servers[i].log.reserve(LOG_MAX_SIZE);
         for (int j = 0; j < SERVER_COUNT; ++j) {
             if (i != j) {
                 servers[i].others.push_back(&servers[j]);
             }
+            servers[i].next_index.push_back(0);
+            servers[i].match_index.push_back(0);
         }
 
     }
 
+    float client_push_log_timer = PUSH_LOG_TIMER * (float)rand() / (float)RAND_MAX;
+
     InitWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "radeau");
     while (!WindowShouldClose()) {
         float dt = GetFrameTime();
+
+        client_push_log_timer -= dt;
+        if (client_push_log_timer <= 0.0f) {
+            client_push_log_timer = PUSH_LOG_TIMER * (float)rand() / (float)RAND_MAX;
+            auto leader = std::find_if(begin(servers), end(servers), [](Server& s) {
+                // TODO: isn't the real leader the one with max term in case of two leaders ?
+                return s.state == ServerState::Leader;
+            });
+            if (leader != end(servers)) {
+                server_push_log(*leader, "hello");
+            }
+        }
+
         for (Server& server: servers) {
             update_server(server, dt);
         }
