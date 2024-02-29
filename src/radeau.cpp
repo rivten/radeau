@@ -58,6 +58,8 @@ struct RequestVote {
 struct RequestVoteResponse {
     int term;
     bool vote_granted;
+
+    size_t initial_message_id;
 };
 
 struct AppendEntries {
@@ -73,16 +75,29 @@ struct AppendEntries {
 struct AppendEntriesResponse {
     int term;
     bool success;
+
+    size_t initial_message_id;
 };
 
 struct RPC {
     RPCType type;
+    size_t message_id;
     union {
         RequestVote request_vote;
         RequestVoteResponse request_vote_response;
         AppendEntries append_entries;
         AppendEntriesResponse append_entries_response;
     };
+};
+
+#define MESSAGE_TIMEOUT 10.0f
+
+struct UnansweredMessage
+{
+    size_t id;
+    float time;
+
+    bool operator==(const UnansweredMessage& other) const = default;
 };
 
 struct Server {
@@ -108,6 +123,8 @@ struct Server {
     float heartbeat_timer;
     std::list<RPC> messages;
     int vote_count {0};
+    size_t next_message_id {1};
+    std::list<UnansweredMessage> unanswered_messages;
 };
 
 #define SERVER_COUNT 5
@@ -156,34 +173,39 @@ AppendEntriesResponse server_send_append_entries(Server& server, AppendEntries a
     return AppendEntriesResponse{ server.term, true };
 }
 
-RequestVoteResponse server_send_request_vote(Server& server, RequestVote request_vote) {
+RequestVoteResponse server_send_request_vote(Server& server, RequestVote request_vote, size_t message_id) {
     RequestVoteResponse response {};
     if (server.term > request_vote.term) {
         response.term = server.term;
         response.vote_granted = false;
+        response.initial_message_id = message_id;
     } else if ((server.voted_for == 0 || server.voted_for == request_vote.candidate_id) && (server.log.size() == 0 || request_vote.last_log_term >= server.log.back().term) && (server.log.size() == 0 || request_vote.last_log_index >= server.log.back().index)) {
         response.term = server.term;
         server.voted_for = request_vote.candidate_id;
         response.vote_granted = true;
+        response.initial_message_id = message_id;
     } else {
         response.term = server.term;
         response.vote_granted = false;
+        response.initial_message_id = message_id;
     }
     return response;
 }
 
 void server_send_rpc(Server& server, RPC rpc) {
+    assert(rpc.message_id != 0);
     server.messages.push_back(rpc);
 }
 
 void answer_rpc(Server& server, RPC rpc) {
+    assert(rpc.message_id != 0);
     switch (rpc.type) {
         case RPCType::RequestVote: {
             if (server.term < rpc.request_vote.term) {
                 server.term = rpc.request_vote.term;
                 server.state = ServerState::Follower;
             }
-            RequestVoteResponse request_vote_response = server_send_request_vote(server, rpc.request_vote);
+            RequestVoteResponse request_vote_response = server_send_request_vote(server, rpc.request_vote, rpc.message_id);
             auto s = std::find_if(begin(server.others), end(server.others), [rv = rpc.request_vote](Server* s) {
                 return s->id == rv.candidate_id;
             });
@@ -269,7 +291,11 @@ void update_leader(Server& server, float dt) {
             };
             RPC rpc;
             rpc.type = RPCType::AppendEntries;
+            rpc.message_id = server.next_message_id;
+            server.next_message_id++;
             rpc.append_entries = append_entries;
+            rpc.message_id = server.next_message_id;
+            server.next_message_id++;
             server_send_rpc(*other, rpc);
         }
     }
@@ -278,7 +304,7 @@ void update_leader(Server& server, float dt) {
         size_t last_log_index = server.log.back().index;
         for (Server* other: server.others) {
             size_t next_index = server.next_index[other->id];
-            size_t match_index = server.match_index[other->id];
+            //size_t match_index = server.match_index[other->id];
             if (last_log_index >= next_index) {
                 AppendEntries append_entries = AppendEntries {
                     server.term,
@@ -325,10 +351,14 @@ void update_follower(Server& server, float dt) {
         server.state = ServerState::Candidate;
         server.election_timer = 1.0f + ELECTION_TIMEOUT * (float)rand() / (float)RAND_MAX;
         for (Server* other: server.others) {
-            server_send_rpc(*other, RPC {
+            RPC rpc  = RPC{
                 RPCType::RequestVote,
+                server.next_message_id,
                 RequestVote {server.term, server.id, server.log.size() == 0 ? 0 : server.log.back().index, server.log.size() == 0 ? 0 : server.log.back().term},
-            });
+            };
+            server.next_message_id++;
+            server.unanswered_messages.push_back(UnansweredMessage { rpc.message_id, 0.0f });
+            server_send_rpc(*other, rpc);
         }
     }
 }
@@ -338,6 +368,15 @@ void update_server(Server& server, float dt) {
         server.last_applied++;
         // apply server.log[last_applied]
     }
+
+    for (UnansweredMessage& message: server.unanswered_messages) {
+        assert(message.id != 0);
+        message.time += dt;
+        if (message.time >= MESSAGE_TIMEOUT) {
+            server.unanswered_messages.remove(message);
+        }
+    }
+
     switch (server.state) {
         case ServerState::Leader: {
             update_leader(server, dt);
