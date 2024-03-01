@@ -82,8 +82,8 @@ struct AppendEntriesResponse {
 
 struct RPC {
     RPCType type;
-    size_t message_id;
-    int sender_id;
+    size_t message_id {0};
+    int sender_id {0};
     union {
         RequestVote request_vote;
         RequestVoteResponse request_vote_response;
@@ -98,8 +98,7 @@ struct UnansweredMessage
 {
     size_t id;
     float time;
-
-    bool operator==(const UnansweredMessage& other) const = default;
+    int sender_id;
 };
 
 struct Server {
@@ -215,6 +214,8 @@ void answer_rpc(Server& server, RPC rpc) {
             RPC response;
             response.type = RPCType::RequestVoteResponse;
             response.sender_id = server.id;
+            response.message_id = server.next_message_id;
+            server.next_message_id++;
             response.request_vote_response = request_vote_response;
             server_send_rpc(**s, response);
         } break;
@@ -233,6 +234,8 @@ void answer_rpc(Server& server, RPC rpc) {
             response.type = RPCType::AppendEntriesResponse;
             response.sender_id = server.id;
             response.append_entries_response = append_entries_response;
+            response.message_id = server.next_message_id;
+            server.next_message_id++;
             auto s = std::find_if(begin(server.others), end(server.others), [rv = rpc.request_vote](Server* s) {
                 return s->id == rv.candidate_id;
             });
@@ -257,7 +260,7 @@ void answer_rpc(Server& server, RPC rpc) {
                 server.votes.clear();
                 server.heartbeat_timer = 0.0f;
                 for (int i = 0; i < SERVER_COUNT; ++i) {
-                    server.next_index[i] = server.log.size() == 0 ? 1 : server.log.back().index + 1;
+                    server.next_index[i] = server.log.size() == 0 ? 0 : server.log.back().index + 1;
                     server.match_index[i] = 0;
                 }
             }
@@ -297,10 +300,10 @@ void update_leader(Server& server, float dt) {
             RPC rpc;
             rpc.type = RPCType::AppendEntries;
             rpc.message_id = server.next_message_id;
+            rpc.sender_id = server.id;
             server.next_message_id++;
             rpc.append_entries = append_entries;
-            rpc.message_id = server.next_message_id;
-            server.next_message_id++;
+            server.unanswered_messages.push_back(UnansweredMessage { rpc.message_id, 0.0f, other->id });
             server_send_rpc(*other, rpc);
         }
     }
@@ -308,8 +311,8 @@ void update_leader(Server& server, float dt) {
     if (server.log.size() != 0) {
         size_t last_log_index = server.log.back().index;
         for (Server* other: server.others) {
-            size_t next_index = server.next_index[other->id];
-            //size_t match_index = server.match_index[other->id];
+            size_t next_index = server.next_index[other->id - 1];
+            //size_t match_index = server.match_index[other->id - 1];
             if (last_log_index >= next_index) {
                 assert(next_index < server.log.size());
                 AppendEntries append_entries = AppendEntries {
@@ -318,12 +321,15 @@ void update_leader(Server& server, float dt) {
                     server.log.back().index,
                     server.log.back().term,
                     &server.log[next_index],
-                    last_log_index - next_index + 1,
+                    last_log_index - next_index,
                     server.commit_index,
                 };
                 RPC rpc;
                 rpc.type = RPCType::AppendEntries;
                 rpc.append_entries = append_entries;
+                rpc.message_id = server.next_message_id;
+                rpc.sender_id = server.id;
+                server.next_message_id++;
                 server_send_rpc(*other, rpc);
             }
         }
@@ -364,7 +370,7 @@ void update_follower(Server& server, float dt) {
                 RequestVote {server.term, server.id, server.log.size() == 0 ? 0 : server.log.back().index, server.log.size() == 0 ? 0 : server.log.back().term},
             };
             server.next_message_id++;
-            server.unanswered_messages.push_back(UnansweredMessage { rpc.message_id, 0.0f });
+            server.unanswered_messages.push_back(UnansweredMessage { rpc.message_id, 0.0f, other->id });
             server_send_rpc(*other, rpc);
         }
     }
@@ -376,13 +382,13 @@ void update_server(Server& server, float dt) {
         // apply server.log[last_applied]
     }
 
+
     for (UnansweredMessage& message: server.unanswered_messages) {
         assert(message.id != 0);
         message.time += dt;
-        if (message.time >= MESSAGE_TIMEOUT) {
-            server.unanswered_messages.remove(message);
-        }
     }
+
+    server.unanswered_messages.remove_if([](const UnansweredMessage& message){return message.time >= MESSAGE_TIMEOUT;});
 
     switch (server.state) {
         case ServerState::Leader: {
@@ -413,6 +419,7 @@ static Color server_draw_color(ServerState server_state) {
         default:
             assert(false);
     }
+    return SRCERY_BLACK;
 }
 
 #define PUSH_LOG_TIMER 10.0f
@@ -484,13 +491,6 @@ int main() {
 
         EndDrawing();
     }
-
-    //while (true) {
-    //    const float dt = 1.0f;
-    //    for (Server& server: servers) {
-    //        update_server(server, dt);
-    //    }
-    //}
 
     return 0;
 }
