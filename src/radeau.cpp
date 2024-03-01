@@ -60,7 +60,7 @@ struct RequestVoteResponse {
     int term;
     bool vote_granted;
 
-    size_t initial_message_id;
+    size_t initial_message_id  {0};
 };
 
 struct AppendEntries {
@@ -132,7 +132,7 @@ struct Server {
 
 #define ELECTION_TIMEOUT 10.0f
 
-AppendEntriesResponse server_send_append_entries(Server& server, AppendEntries append_entries) {
+AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append_entries) {
     assert(server.state != ServerState::Leader);
 
     if (server.state == ServerState::Candidate) {
@@ -142,6 +142,7 @@ AppendEntriesResponse server_send_append_entries(Server& server, AppendEntries a
     server.election_timer = 1.0f + ELECTION_TIMEOUT * (float)rand() / (float)RAND_MAX;
 
     if (append_entries.term < server.term) {
+        // todo: add message id
         return AppendEntriesResponse { server.term, false };
     }
     //if (server.log.size() <= append_entries.prev_log_index - 1) {
@@ -157,7 +158,7 @@ AppendEntriesResponse server_send_append_entries(Server& server, AppendEntries a
             return AppendEntriesResponse {server.term, false};
         }
         if (log.term != append_entries.term) {
-            server.log.resize(append_entries.prev_log_index - 1); // not sure about - 1 here
+            server.log.resize(append_entries.prev_log_index - 2); // not sure about - 1 here
         }
     }
     for (size_t i = 0; i < append_entries.entry_count; ++i) {
@@ -174,7 +175,7 @@ AppendEntriesResponse server_send_append_entries(Server& server, AppendEntries a
     return AppendEntriesResponse{ server.term, true };
 }
 
-RequestVoteResponse server_send_request_vote(Server& server, RequestVote request_vote, size_t message_id) {
+RequestVoteResponse answer_request_vote(Server& server, RequestVote request_vote, size_t message_id) {
     RequestVoteResponse response {};
     if (server.term > request_vote.term) {
         response.term = server.term;
@@ -194,7 +195,9 @@ RequestVoteResponse server_send_request_vote(Server& server, RequestVote request
 }
 
 void server_send_rpc(Server& server, RPC rpc) {
-    assert(rpc.message_id != 0);
+    if (rpc.type == RPCType::RequestVote || rpc.type == RPCType::AppendEntries) {
+        assert(rpc.message_id != 0);
+    }
     server.messages.push_back(rpc);
 }
 
@@ -207,7 +210,7 @@ void answer_rpc(Server& server, RPC rpc) {
                 server.term = rpc.request_vote.term;
                 server.state = ServerState::Follower;
             }
-            RequestVoteResponse request_vote_response = server_send_request_vote(server, rpc.request_vote, rpc.message_id);
+            RequestVoteResponse request_vote_response = answer_request_vote(server, rpc.request_vote, rpc.message_id);
             auto s = std::find_if(begin(server.others), end(server.others), [rv = rpc.request_vote](Server* s) {
                 return s->id == rv.candidate_id;
             });
@@ -229,7 +232,7 @@ void answer_rpc(Server& server, RPC rpc) {
                 server.state = ServerState::Follower;
             }
 
-            AppendEntriesResponse append_entries_response = server_send_append_entries(server, rpc.append_entries);
+            AppendEntriesResponse append_entries_response = answer_append_entries(server, rpc.append_entries);
             RPC response;
             response.type = RPCType::AppendEntriesResponse;
             response.sender_id = server.id;
@@ -271,6 +274,9 @@ void answer_rpc(Server& server, RPC rpc) {
                 server.state = ServerState::Follower;
             }
             assert(server.state == ServerState::Leader);
+            assert(rpc.append_entries_response.initial_message_id != 0);
+            auto unanswered_message = std::find_if(begin(server.unanswered_messages), end(server.unanswered_messages), [&rpc](const UnansweredMessage& msg){return msg.sender_id == rpc.sender_id && msg.id == rpc.append_entries_response.initial_message_id;});
+            assert(unanswered_message != end(server.unanswered_messages));
         } break;
         default:
             assert(false);
@@ -279,11 +285,6 @@ void answer_rpc(Server& server, RPC rpc) {
 
 void update_leader(Server& server, float dt) {
     server.heartbeat_timer -= dt;
-
-    for (RPC rpc: server.messages) {
-        answer_rpc(server, rpc);
-    }
-    server.messages.clear();
 
     if (server.heartbeat_timer <= 0.0f) {
         server.heartbeat_timer = 3.0f * (float)rand() / (float)RAND_MAX;
@@ -338,10 +339,6 @@ void update_leader(Server& server, float dt) {
 
 void update_candidate(Server& server, float dt) {
     server.election_timer -= dt;
-    for (RPC rpc: server.messages) {
-        answer_rpc(server, rpc);
-    }
-    server.messages.clear();
 
     if (server.election_timer <= 0.0f) {
         server.state = ServerState::Follower;
@@ -350,11 +347,6 @@ void update_candidate(Server& server, float dt) {
 
 void update_follower(Server& server, float dt) {
     server.election_timer -= dt;
-
-    for (RPC rpc: server.messages) {
-        answer_rpc(server, rpc);
-    }
-    server.messages.clear();
 
     if (server.election_timer <= 0.0f) {
         // start the election
@@ -389,6 +381,11 @@ void update_server(Server& server, float dt) {
     }
 
     server.unanswered_messages.remove_if([](const UnansweredMessage& message){return message.time >= MESSAGE_TIMEOUT;});
+
+    for (RPC rpc: server.messages) {
+        answer_rpc(server, rpc);
+    }
+    server.messages.clear();
 
     switch (server.state) {
         case ServerState::Leader: {
