@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <list>
+#include <unordered_set>
 
 #include <raylib.h>
 
@@ -82,6 +83,7 @@ struct AppendEntriesResponse {
 struct RPC {
     RPCType type;
     size_t message_id;
+    int sender_id;
     union {
         RequestVote request_vote;
         RequestVoteResponse request_vote_response;
@@ -122,7 +124,7 @@ struct Server {
     // simulation state -- not part of raft
     float heartbeat_timer;
     std::list<RPC> messages;
-    int vote_count {0};
+    std::unordered_set<int> votes;
     size_t next_message_id {1};
     std::list<UnansweredMessage> unanswered_messages;
 };
@@ -199,6 +201,7 @@ void server_send_rpc(Server& server, RPC rpc) {
 
 void answer_rpc(Server& server, RPC rpc) {
     assert(rpc.message_id != 0);
+    assert(rpc.sender_id != 0);
     switch (rpc.type) {
         case RPCType::RequestVote: {
             if (server.term < rpc.request_vote.term) {
@@ -211,6 +214,7 @@ void answer_rpc(Server& server, RPC rpc) {
             });
             RPC response;
             response.type = RPCType::RequestVoteResponse;
+            response.sender_id = server.id;
             response.request_vote_response = request_vote_response;
             server_send_rpc(**s, response);
         } break;
@@ -227,6 +231,7 @@ void answer_rpc(Server& server, RPC rpc) {
             AppendEntriesResponse append_entries_response = server_send_append_entries(server, rpc.append_entries);
             RPC response;
             response.type = RPCType::AppendEntriesResponse;
+            response.sender_id = server.id;
             response.append_entries_response = append_entries_response;
             auto s = std::find_if(begin(server.others), end(server.others), [rv = rpc.request_vote](Server* s) {
                 return s->id == rv.candidate_id;
@@ -244,12 +249,12 @@ void answer_rpc(Server& server, RPC rpc) {
             RequestVoteResponse request_vote_response = rpc.request_vote_response;
             if (request_vote_response.vote_granted) {
                 assert(request_vote_response.term <= server.term);
-                server.vote_count++;
+                server.votes.insert(rpc.sender_id);
             }
-            if (server.vote_count * 2 > SERVER_COUNT) {
+            if (server.votes.size() * 2 > SERVER_COUNT) {
                 // majority of votes, become the leader
                 server.state = ServerState::Leader;
-                server.vote_count = 0;
+                server.votes.clear();
                 server.heartbeat_timer = 0.0f;
                 for (int i = 0; i < SERVER_COUNT; ++i) {
                     server.next_index[i] = server.log.size() == 0 ? 1 : server.log.back().index + 1;
@@ -306,6 +311,7 @@ void update_leader(Server& server, float dt) {
             size_t next_index = server.next_index[other->id];
             //size_t match_index = server.match_index[other->id];
             if (last_log_index >= next_index) {
+                assert(next_index < server.log.size());
                 AppendEntries append_entries = AppendEntries {
                     server.term,
                     server.id,
@@ -354,6 +360,7 @@ void update_follower(Server& server, float dt) {
             RPC rpc  = RPC{
                 RPCType::RequestVote,
                 server.next_message_id,
+                server.id,
                 RequestVote {server.term, server.id, server.log.size() == 0 ? 0 : server.log.back().index, server.log.size() == 0 ? 0 : server.log.back().term},
             };
             server.next_message_id++;
