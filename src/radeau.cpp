@@ -147,6 +147,7 @@ AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append
     if (append_entries.term < server.term) {
         return AppendEntriesResponse { server.term, false, initial_message_id };
     }
+
     //if (server.log.size() <= append_entries.prev_log_index - 1) {
     //    return AppendEntriesResponse { server.term, false, initial_message_id };
     //}
@@ -154,16 +155,37 @@ AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append
     //if (log.term != append_entries.prev_log_term) {
     //    return AppendEntriesResponse { server.term, false, initial_message_id };
     //}
-    if (server_get_last_log_index(server) > append_entries.prev_log_index) {
-        Log log = server.log[append_entries.prev_log_index - 1];
-        if (log.term != append_entries.prev_log_term) {
-            return AppendEntriesResponse {server.term, false, initial_message_id};
-        }
-        if (log.term != append_entries.term) {
-            server.log.resize(append_entries.prev_log_index - 2); // not sure about - 1 here
+
+    if (server_get_last_log_index(server) <= append_entries.prev_log_index) {
+        return AppendEntriesResponse {server.term, false, initial_message_id};
+    }
+    Log log = server.log[append_entries.prev_log_index];
+    if (log.term != append_entries.prev_log_term) {
+        return AppendEntriesResponse {server.term, false, initial_message_id};
+    }
+    for (size_t i = 0; i < append_entries.entry_count; ++i) {
+        Log log_to_add = append_entries.entries[i];
+        // checking existing log entry
+        size_t log_index = append_entries.prev_log_index + 1 + i;
+        if (log_index < server.log.size()) {
+            Log existing_log = server.log[log_index];
+            if (existing_log.term != log_to_add.term || existing_log.log != log_to_add.log) {
+                // conflict ! removing everything that follow
+                // TODO: we should assert that nothing is commited
+                server.log.resize(log_index - 1);
+                break;
+            }
         }
     }
     for (size_t i = 0; i < append_entries.entry_count; ++i) {
+        Log log_to_add = append_entries.entries[i];
+        size_t log_index = append_entries.prev_log_index + 1 + i;
+        if (log_index < server.log.size()) {
+            Log existing_log = server.log[log_index];
+            if (existing_log.term == log_to_add.term && existing_log.log == log_to_add.log) {
+                continue;
+            }
+        }
         assert(server.log.size() < LOG_MAX_SIZE);
         server.log.push_back(append_entries.entries[i]);
     }
@@ -262,7 +284,7 @@ void answer_rpc(Server& server, RPC rpc) {
                 server.votes.clear();
                 server.heartbeat_timer = 0.0f;
                 for (int i = 0; i < SERVER_COUNT; ++i) {
-                    server.next_index[i] = server.log.size();
+                    server.next_index[i] = server.log.size() + 1;
                     server.match_index[i] = 0;
                 }
             }
@@ -303,7 +325,7 @@ void update_leader(Server& server, float dt) {
             server.next_message_id++;
             rpc.sender_id = server.id;
             rpc.append_entries = append_entries;
-            server.unanswered_messages.push_back(UnansweredMessage { rpc.message_id, 0.0f, other->id });
+            server.unanswered_messages.push_back(UnansweredMessage { rpc.message_id, 0.0f, other->id, rpc.type });
             server_send_rpc(*other, rpc);
         }
     }
@@ -314,12 +336,14 @@ void update_leader(Server& server, float dt) {
             size_t next_index = server.next_index[other->id - 1];
             //size_t match_index = server.match_index[other->id - 1];
             if (last_log_index >= next_index) {
-                assert(next_index < server.log.size());
+                //assert(next_index < server.log.size());
+                assert(next_index > 0);
+                assert(server.log.size() > 0);
                 AppendEntries append_entries = AppendEntries {
                     server.term,
                     server.id,
-                    server.log.size(),
-                    server.log.back().term,
+                    next_index - 1,
+                    server.log[next_index - 1].term,
                     &server.log[next_index],
                     last_log_index - next_index,
                     server.commit_index,
@@ -329,7 +353,7 @@ void update_leader(Server& server, float dt) {
                 rpc.append_entries = append_entries;
                 rpc.message_id = server.next_message_id;
                 server.next_message_id++;
-                server.unanswered_messages.push_back(UnansweredMessage { rpc.message_id, 0.0f, other->id });
+                server.unanswered_messages.push_back(UnansweredMessage { rpc.message_id, 0.0f, other->id, rpc.type });
                 rpc.sender_id = server.id;
                 server_send_rpc(*other, rpc);
             }
@@ -362,7 +386,7 @@ void update_follower(Server& server, float dt) {
                 RequestVote {server.term, server.id, server.log.size(), server.log.size() == 0 ? 0 : server.log.back().term},
             };
             server.next_message_id++;
-            server.unanswered_messages.push_back(UnansweredMessage { rpc.message_id, 0.0f, other->id });
+            server.unanswered_messages.push_back(UnansweredMessage { rpc.message_id, 0.0f, other->id, rpc.type });
             server_send_rpc(*other, rpc);
         }
     }
