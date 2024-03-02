@@ -32,7 +32,6 @@
 
 struct Log {
     int term;
-    size_t index;
     std::string log;
 };
 
@@ -132,6 +131,10 @@ struct Server {
 
 #define ELECTION_TIMEOUT 10.0f
 
+size_t server_get_last_log_index(const Server& server) {
+    return server.log.size();
+}
+
 AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append_entries, size_t initial_message_id) {
     assert(server.state != ServerState::Leader);
 
@@ -142,7 +145,6 @@ AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append
     server.election_timer = 1.0f + ELECTION_TIMEOUT * (float)rand() / (float)RAND_MAX;
 
     if (append_entries.term < server.term) {
-        // todo: add message id
         return AppendEntriesResponse { server.term, false, initial_message_id };
     }
     //if (server.log.size() <= append_entries.prev_log_index - 1) {
@@ -152,7 +154,7 @@ AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append
     //if (log.term != append_entries.prev_log_term) {
     //    return AppendEntriesResponse { server.term, false, initial_message_id };
     //}
-    if (server.log.size() > append_entries.prev_log_index - 1) {
+    if (server_get_last_log_index(server) > append_entries.prev_log_index) {
         Log log = server.log[append_entries.prev_log_index - 1];
         if (log.term != append_entries.prev_log_term) {
             return AppendEntriesResponse {server.term, false, initial_message_id};
@@ -169,7 +171,7 @@ AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append
         if (append_entries.entry_count == 0) {
             server.commit_index = append_entries.leader_commit_index;
         } else {
-            server.commit_index = std::min(append_entries.leader_commit_index, append_entries.entries[append_entries.entry_count - 1].index);
+            server.commit_index = std::min(append_entries.leader_commit_index, append_entries.entry_count);
         }
     }
     return AppendEntriesResponse{ server.term, true, initial_message_id };
@@ -181,7 +183,7 @@ RequestVoteResponse answer_request_vote(Server& server, RequestVote request_vote
         response.term = server.term;
         response.vote_granted = false;
         response.initial_message_id = initial_message_id;
-    } else if ((server.voted_for == 0 || server.voted_for == request_vote.candidate_id) && (server.log.size() == 0 || request_vote.last_log_term >= server.log.back().term) && (server.log.size() == 0 || request_vote.last_log_index >= server.log.back().index)) {
+    } else if ((server.voted_for == 0 || server.voted_for == request_vote.candidate_id) && (server.log.size() == 0 || request_vote.last_log_term >= server.log.back().term) && (request_vote.last_log_index >= server.log.size())) {
         response.term = server.term;
         server.voted_for = request_vote.candidate_id;
         response.vote_granted = true;
@@ -260,7 +262,7 @@ void answer_rpc(Server& server, RPC rpc) {
                 server.votes.clear();
                 server.heartbeat_timer = 0.0f;
                 for (int i = 0; i < SERVER_COUNT; ++i) {
-                    server.next_index[i] = server.log.size() == 0 ? 0 : server.log.back().index + 1;
+                    server.next_index[i] = server.log.size();
                     server.match_index[i] = 0;
                 }
             }
@@ -289,7 +291,7 @@ void update_leader(Server& server, float dt) {
             AppendEntries append_entries = AppendEntries {
                 server.term,
                 server.id,
-                server.log.size() == 0 ? 0 : server.log.back().index,
+                server.log.size(),
                 server.log.size() == 0 ? 0 : server.log.back().term,
                 nullptr,
                 0,
@@ -307,7 +309,7 @@ void update_leader(Server& server, float dt) {
     }
 
     if (server.log.size() != 0) {
-        size_t last_log_index = server.log.back().index;
+        size_t last_log_index = server.log.size();
         for (Server* other: server.others) {
             size_t next_index = server.next_index[other->id - 1];
             //size_t match_index = server.match_index[other->id - 1];
@@ -316,7 +318,7 @@ void update_leader(Server& server, float dt) {
                 AppendEntries append_entries = AppendEntries {
                     server.term,
                     server.id,
-                    server.log.back().index,
+                    server.log.size(),
                     server.log.back().term,
                     &server.log[next_index],
                     last_log_index - next_index,
@@ -357,7 +359,7 @@ void update_follower(Server& server, float dt) {
                 RPCType::RequestVote,
                 server.next_message_id,
                 server.id,
-                RequestVote {server.term, server.id, server.log.size() == 0 ? 0 : server.log.back().index, server.log.size() == 0 ? 0 : server.log.back().term},
+                RequestVote {server.term, server.id, server.log.size(), server.log.size() == 0 ? 0 : server.log.back().term},
             };
             server.next_message_id++;
             server.unanswered_messages.push_back(UnansweredMessage { rpc.message_id, 0.0f, other->id });
@@ -425,7 +427,6 @@ static void server_push_log(Server& server, std::string log) {
     assert(server.log.size() < LOG_MAX_SIZE);
     server.log.push_back(Log {
         server.term,
-        server.log.size() == 0 ? 1 : server.log.back().index + 1,
         log,
     });
 }
