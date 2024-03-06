@@ -65,7 +65,7 @@ struct RequestVoteResponse {
 struct AppendEntries {
     int term;
     int leader_id;
-    size_t prev_log_index;
+    int prev_log_index;
     int prev_log_term;
     Log* entries;
     size_t entry_count;
@@ -117,7 +117,7 @@ struct Server {
     size_t last_applied;
 
     // volatide leader-only state
-    std::vector<size_t> next_index; // also contains oneself, but ignored
+    std::vector<int> next_index; // also contains oneself, but ignored
     std::vector<size_t> match_index; // also contains oneself, but ignored
 
     // simulation state -- not part of raft
@@ -132,11 +132,20 @@ struct Server {
 
 #define ELECTION_TIMEOUT 10.0f
 
-size_t server_get_last_log_index(const Server& server) {
+static void server_push_log(Server& server, int term, std::string log) {
+    TraceLog(LOG_INFO, TextFormat("(server %i) pushing log [%i %s] at index %zu", server.id, server.term, log.c_str(), server.log.size()));
+    assert(server.log.size() < LOG_MAX_SIZE);
+    server.log.push_back(Log {
+        term,
+        log,
+    });
+}
+
+int server_get_last_log_index(const Server& server) {
     return server.log.size();
 }
 
-AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append_entries, size_t initial_message_id) {
+AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append_entries, size_t initial_message_id, int sender_id) {
     assert(server.state != ServerState::Leader);
 
     if (server.state == ServerState::Candidate) {
@@ -145,7 +154,13 @@ AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append
     server.voted_for = 0;
     server.election_timer = 1.0f + ELECTION_TIMEOUT * (float)rand() / (float)RAND_MAX;
 
+    if (append_entries.entry_count == 0) {
+        TraceLog(LOG_INFO, "(server %i) received AppendEntries heartbeat from server %i", server.id, sender_id, server.term, append_entries.term);
+        return AppendEntriesResponse { server.term, true, initial_message_id };
+    }
+
     if (append_entries.term < server.term) {
+        TraceLog(LOG_INFO, "(server %i) received AppendEntries from server %i with old term (my term: %s, her term: %s)", server.id, sender_id, server.term, append_entries.term);
         return AppendEntriesResponse { server.term, false, initial_message_id };
     }
 
@@ -158,10 +173,12 @@ AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append
     //}
 
     if (server_get_last_log_index(server) <= append_entries.prev_log_index) {
+        TraceLog(LOG_INFO, "(server %i) received AppendEntries from server %i with log too big (my log index: %zu, her log index: %zu)", server.id, sender_id, server_get_last_log_index(server), append_entries.prev_log_index);
         return AppendEntriesResponse {server.term, false, initial_message_id};
     }
     Log log = server.log[append_entries.prev_log_index];
     if (log.term != append_entries.prev_log_term) {
+        TraceLog(LOG_INFO, "(server %i) received AppendEntries from server %i with bad previous log term (my log term: %i, her log term: %i)", server.id, sender_id, log.term, append_entries.prev_log_term);
         return AppendEntriesResponse {server.term, false, initial_message_id};
     }
     for (size_t i = 0; i < append_entries.entry_count; ++i) {
@@ -174,6 +191,7 @@ AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append
                 // conflict ! removing everything that follow
                 // TODO: we should assert that nothing is commited
                 server.log.resize(log_index - 1);
+                TraceLog(LOG_INFO, TextFormat("(server %i) Resized log size to %i", server.id, server.log.size()));
                 break;
             }
         }
@@ -184,11 +202,11 @@ AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append
         if (log_index < server.log.size()) {
             Log existing_log = server.log[log_index];
             if (existing_log.term == log_to_add.term && existing_log.log == log_to_add.log) {
+                // TODO: log
                 continue;
             }
         }
-        assert(server.log.size() < LOG_MAX_SIZE);
-        server.log.push_back(append_entries.entries[i]);
+        server_push_log(server, append_entries.entries[i].term, append_entries.entries[i].log);
     }
     if (append_entries.leader_commit_index > server.commit_index) {
         if (append_entries.entry_count == 0) {
@@ -200,18 +218,21 @@ AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append
     return AppendEntriesResponse{ server.term, true, initial_message_id };
 }
 
-RequestVoteResponse answer_request_vote(Server& server, RequestVote request_vote, size_t initial_message_id) {
+RequestVoteResponse answer_request_vote(Server& server, RequestVote request_vote, size_t initial_message_id, int sender_id) {
     RequestVoteResponse response {};
     if (server.term > request_vote.term) {
+        TraceLog(LOG_INFO, TextFormat("(server %i) received RequestVote from server %i with term too low (my term: %i, her term: %i)", server.id, sender_id, server.term, request_vote.term));
         response.term = server.term;
         response.vote_granted = false;
         response.initial_message_id = initial_message_id;
     } else if ((server.voted_for == 0 || server.voted_for == request_vote.candidate_id) && (server.log.size() == 0 || request_vote.last_log_term >= server.log.back().term) && (request_vote.last_log_index >= server.log.size())) {
+        TraceLog(LOG_INFO, TextFormat("(server %i) received RequestVote from server %i. ok to vote for her", server.id, sender_id, server.term, request_vote.term));
         response.term = server.term;
         server.voted_for = request_vote.candidate_id;
         response.vote_granted = true;
         response.initial_message_id = initial_message_id;
     } else {
+        TraceLog(LOG_INFO, TextFormat("(server %i) received RequestVote from server %i. log mismatch or voted for someone already", server.id, sender_id));
         response.term = server.term;
         response.vote_granted = false;
         response.initial_message_id = initial_message_id;
@@ -226,10 +247,11 @@ void server_send_rpc(Server& server, RPC rpc) {
 
 void process_request_vote(Server& server, RequestVote request_vote, size_t message_id, int sender_id) {
         if (server.term < request_vote.term) {
+            TraceLog(LOG_INFO, TextFormat("(server %i) received RequestVote response from server %i. her term is higher than mine, will become follower", server.id, sender_id));
             server.term = request_vote.term;
             server.state = ServerState::Follower;
         }
-        RequestVoteResponse request_vote_response = answer_request_vote(server, request_vote, message_id);
+        RequestVoteResponse request_vote_response = answer_request_vote(server, request_vote, message_id, sender_id);
         auto s = std::find_if(begin(server.others), end(server.others), [rv = request_vote](Server* s) {
             return s->id == rv.candidate_id;
         });
@@ -244,6 +266,7 @@ void process_request_vote(Server& server, RequestVote request_vote, size_t messa
 
 void process_append_entries(Server& server, AppendEntries append_entries, size_t message_id, int sender_id) {
     if (server.term < append_entries.term) {
+        TraceLog(LOG_INFO, TextFormat("(server %i) received RequestVote response from server %i. her term is higher than mine, will become follower", server.id, sender_id));
         server.term = append_entries.term;
         server.state = ServerState::Follower;
     }
@@ -252,7 +275,7 @@ void process_append_entries(Server& server, AppendEntries append_entries, size_t
         server.state = ServerState::Follower;
     }
 
-    AppendEntriesResponse append_entries_response = answer_append_entries(server, append_entries, message_id);
+    AppendEntriesResponse append_entries_response = answer_append_entries(server, append_entries, message_id, sender_id);
     RPC response;
     response.type = RPCType::AppendEntriesResponse;
     response.sender_id = server.id;
@@ -268,35 +291,54 @@ void process_append_entries(Server& server, AppendEntries append_entries, size_t
 void process_request_vote_response(Server& server, RequestVoteResponse request_vote_response, size_t message_id, int sender_id) {
     assert(server.state == ServerState::Candidate || server.state == ServerState::Leader);
     if (server.term < request_vote_response.term) {
+        TraceLog(LOG_INFO, TextFormat("(server %i) received RequestVote response from server %i. her term is higher than mine, will become follower", server.id, sender_id));
         server.term = request_vote_response.term;
         server.state = ServerState::Follower;
     }
 
     if (request_vote_response.vote_granted) {
+        TraceLog(LOG_INFO, TextFormat("(server %i) received RequestVote response from server %i got her vote", server.id, sender_id));
         assert(request_vote_response.term <= server.term);
         server.votes.insert(sender_id);
     }
     if (server.votes.size() * 2 > SERVER_COUNT) {
         // majority of votes, become the leader
+        TraceLog(LOG_INFO, TextFormat("(server %i) elected leader", server.id));
         server.state = ServerState::Leader;
         server.votes.clear();
         server.heartbeat_timer = 0.0f;
         for (int i = 0; i < SERVER_COUNT; ++i) {
-            server.next_index[i] = server.log.size() + 1;
+            server.next_index[i] = server.log.size();
             server.match_index[i] = 0;
         }
     }
 }
 
 void process_append_entries_response(Server& server, AppendEntriesResponse append_entries_response, size_t message_id, int sender_id) {
-    if (server.term < append_entries_response.term) {
-        server.term = append_entries_response.term;
-        server.state = ServerState::Follower;
-    }
     assert(server.state == ServerState::Leader);
     assert(append_entries_response.initial_message_id != 0);
     auto unanswered_message = std::find_if(begin(server.unanswered_messages), end(server.unanswered_messages), [&append_entries_response, &sender_id](const UnansweredMessage& msg){return msg.send_to_id == sender_id && msg.id == append_entries_response.initial_message_id;});
     assert(unanswered_message != end(server.unanswered_messages));
+
+    if (server.term < append_entries_response.term) {
+        TraceLog(LOG_INFO, TextFormat("(server %i) received AppendEntries response from server %i. her term is higher than mine, will become follower", server.id, sender_id));
+        server.term = append_entries_response.term;
+        server.state = ServerState::Follower;
+        goto cleanup;
+    }
+
+    if (unanswered_message->rpc.append_entries.entry_count != 0) {
+        if (append_entries_response.success) {
+            TraceLog(LOG_INFO, TextFormat("(server %i) received AppendEntries response from server %i. successfull. changing next index from %i to %i", server.id, sender_id, server.next_index[sender_id - 1], unanswered_message->rpc.append_entries.prev_log_index + unanswered_message->rpc.append_entries.entry_count + 1));
+            server.next_index[sender_id - 1] = unanswered_message->rpc.append_entries.prev_log_index + unanswered_message->rpc.append_entries.entry_count + 1;
+        } else {
+            TraceLog(LOG_INFO, TextFormat("(server %i) received AppendEntries response from server %i. response was negative. downgrading next index from %i to %i", server.id, sender_id, server.next_index[sender_id - 1], server.next_index[sender_id - 1] - 1));
+            server.next_index[sender_id - 1]--;
+        }
+    }
+
+cleanup:
+    server.unanswered_messages.erase(unanswered_message);
 }
 
 void process_rpc(Server& server, RPC rpc) {
@@ -325,12 +367,13 @@ void update_leader(Server& server, float dt) {
 
     if (server.heartbeat_timer <= 0.0f) {
         server.heartbeat_timer = 3.0f * (float)rand() / (float)RAND_MAX;
+        TraceLog(LOG_INFO, TextFormat("(server %i) sending heartbeat message", server.id));
         for (Server* other: server.others) {
             AppendEntries append_entries = AppendEntries {
                 server.term,
                 server.id,
-                server.log.size(),
-                server.log.size() == 0 ? 0 : server.log.back().term,
+                0,
+                0,
                 nullptr,
                 0,
                 server.commit_index,
@@ -347,13 +390,14 @@ void update_leader(Server& server, float dt) {
     }
 
     if (server.log.size() != 0) {
-        size_t last_log_index = server.log.size();
+        int last_log_index = server.log.size() - 1;
         for (Server* other: server.others) {
-            size_t next_index = server.next_index[other->id - 1];
+            int next_index = server.next_index[other->id - 1];
             //size_t match_index = server.match_index[other->id - 1];
             if (last_log_index >= next_index) {
+                TraceLog(LOG_INFO, TextFormat("(server %i) server %i has a next index of %zi while my last log index is %zu, sending entries", server.id, other->id, next_index, last_log_index));
                 //assert(next_index < server.log.size());
-                assert(next_index > 0);
+                //assert(next_index > 0);
                 assert(server.log.size() > 0);
                 AppendEntries append_entries = AppendEntries {
                     server.term,
@@ -361,7 +405,7 @@ void update_leader(Server& server, float dt) {
                     next_index - 1,
                     server.log[next_index - 1].term,
                     &server.log[next_index],
-                    last_log_index - next_index,
+                    (size_t)(last_log_index - next_index + 1),
                     server.commit_index,
                 };
                 RPC rpc;
@@ -390,6 +434,7 @@ void update_follower(Server& server, float dt) {
 
     if (server.election_timer <= 0.0f) {
         // start the election
+        TraceLog(LOG_INFO, TextFormat("(server %i) election timeout, triggering election", server.id));
         server.term++;
         server.voted_for = server.id;
         server.state = ServerState::Candidate;
@@ -462,15 +507,6 @@ static Color server_draw_color(ServerState server_state) {
 
 #define PUSH_LOG_TIMER 10.0f
 
-static void server_push_log(Server& server, std::string log) {
-    assert(server.state == ServerState::Leader);
-    assert(server.log.size() < LOG_MAX_SIZE);
-    server.log.push_back(Log {
-        server.term,
-        log,
-    });
-}
-
 int main() {
     std::vector<Server> servers(SERVER_COUNT);
 
@@ -502,7 +538,7 @@ int main() {
                 return s.state == ServerState::Leader;
             });
             if (leader != end(servers)) {
-                server_push_log(*leader, "hello");
+                server_push_log(*leader, leader->term, "hello");
             }
         }
 
@@ -525,6 +561,7 @@ int main() {
             DrawText(TextFormat("Election Timer: %.2f", server.election_timer), server_x, 200, 15, SRCERY_BRIGHTWHITE);
             DrawText(TextFormat("Heartbeat Timer: %.2f", server.heartbeat_timer), server_x, 220, 15, SRCERY_BRIGHTWHITE);
             DrawText(TextFormat("Next Message ID: %zu", server.next_message_id), server_x, 240, 15, SRCERY_BRIGHTWHITE);
+            DrawText(TextFormat("Unanswered count: %d", server.unanswered_messages.size()), server_x, 260, 15, SRCERY_BRIGHTWHITE);
         }
 
         EndDrawing();
