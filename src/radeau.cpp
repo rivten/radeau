@@ -131,6 +131,7 @@ struct Server {
 #define SERVER_COUNT 5
 
 #define ELECTION_TIMEOUT 10.0f
+#define ELECTION_MIN_TIME 3.0f
 
 static void server_push_log(Server& server, int term, std::string log) {
     TraceLog(LOG_INFO, TextFormat("(server %i) pushing log [%i %s] at index %zu", server.id, server.term, log.c_str(), server.log.size()));
@@ -152,7 +153,7 @@ AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append
         server.state = ServerState::Follower;
     }
     server.voted_for = 0;
-    server.election_timer = 1.0f + ELECTION_TIMEOUT * (float)rand() / (float)RAND_MAX;
+    server.election_timer = ELECTION_MIN_TIME + ELECTION_TIMEOUT * (float)rand() / (float)RAND_MAX;
 
     if (append_entries.entry_count == 0) {
         TraceLog(LOG_INFO, "(server %i) received AppendEntries heartbeat from server %i", server.id, sender_id, server.term, append_entries.term);
@@ -202,7 +203,6 @@ AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append
         if (log_index < server.log.size()) {
             Log existing_log = server.log[log_index];
             if (existing_log.term == log_to_add.term && existing_log.log == log_to_add.log) {
-                // TODO: log
                 continue;
             }
         }
@@ -212,7 +212,9 @@ AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append
         if (append_entries.entry_count == 0) {
             server.commit_index = append_entries.leader_commit_index;
         } else {
-            server.commit_index = std::min(append_entries.leader_commit_index, append_entries.entry_count);
+            size_t next_commit_index = std::min(append_entries.leader_commit_index, append_entries.entry_count);
+            TraceLog(LOG_INFO, TextFormat("(server %i) setting commit index to %zu", server.id, next_commit_index));
+            server.commit_index = next_commit_index;
         }
     }
     return AppendEntriesResponse{ server.term, true, initial_message_id };
@@ -331,6 +333,7 @@ void process_append_entries_response(Server& server, AppendEntriesResponse appen
         if (append_entries_response.success) {
             TraceLog(LOG_INFO, TextFormat("(server %i) received AppendEntries response from server %i. successfull. changing next index from %i to %i", server.id, sender_id, server.next_index[sender_id - 1], unanswered_message->rpc.append_entries.prev_log_index + unanswered_message->rpc.append_entries.entry_count + 1));
             server.next_index[sender_id - 1] = unanswered_message->rpc.append_entries.prev_log_index + unanswered_message->rpc.append_entries.entry_count + 1;
+            server.match_index[sender_id - 1] = unanswered_message->rpc.append_entries.prev_log_index + unanswered_message->rpc.append_entries.entry_count;
         } else {
             TraceLog(LOG_INFO, TextFormat("(server %i) received AppendEntries response from server %i. response was negative. downgrading next index from %i to %i", server.id, sender_id, server.next_index[sender_id - 1], server.next_index[sender_id - 1] - 1));
             server.next_index[sender_id - 1]--;
@@ -419,6 +422,18 @@ void update_leader(Server& server, float dt) {
             }
         }
     }
+    for (size_t i = server.commit_index + 1; i < server.log.size(); ++i) {
+        int count_commited = 0;
+        for (int j = 0; j < SERVER_COUNT; ++j) {
+            if (server.match_index[j] >= i) {
+                count_commited++;
+            }
+        }
+        if (2 * count_commited > SERVER_COUNT) {
+            TraceLog(LOG_INFO, "(server %i) committing entry %i", server.id, server.commit_index);
+            server.commit_index = i;
+        }
+    }
 }
 
 void update_candidate(Server& server, float dt) {
@@ -438,7 +453,7 @@ void update_follower(Server& server, float dt) {
         server.term++;
         server.voted_for = server.id;
         server.state = ServerState::Candidate;
-        server.election_timer = 1.0f + ELECTION_TIMEOUT * (float)rand() / (float)RAND_MAX;
+        server.election_timer = ELECTION_MIN_TIME + ELECTION_TIMEOUT * (float)rand() / (float)RAND_MAX;
         for (Server* other: server.others) {
             RPC rpc  = RPC{
                 RPCType::RequestVote,
@@ -512,7 +527,7 @@ int main() {
 
     for (int i = 0; i < SERVER_COUNT; ++i) {
         servers[i].id = i + 1; // ids start at one
-        servers[i].election_timer = 1.0f + ELECTION_TIMEOUT * (float)rand() / (float)RAND_MAX;
+        servers[i].election_timer = ELECTION_MIN_TIME + ELECTION_TIMEOUT * (float)rand() / (float)RAND_MAX;
         servers[i].log.reserve(LOG_MAX_SIZE);
         for (int j = 0; j < SERVER_COUNT; ++j) {
             if (i != j) {
