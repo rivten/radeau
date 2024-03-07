@@ -10,7 +10,6 @@
 
 /*
  * TODO
- *     - fix match_index (not committing when server count < 3)
  *     - gui to display logs, committed or not)
  *     - network partitions
  */
@@ -145,7 +144,7 @@ struct Server {
 static void server_push_log(Server& server, int term, std::string log) {
     assert(!server.is_down);
 
-    TraceLog(LOG_INFO, TextFormat("(server %i) pushing log [%i %s] at index %zu", server.id, server.term, log.c_str(), server.log.size()));
+    TraceLog(LOG_INFO, TextFormat("(server %i) pushing log [%i %s] at index %zu", server.id, server.term, log.c_str(), server.log.size() + 1));
     assert(server.log.size() < LOG_MAX_SIZE);
     server.log.push_back(Log {
         term,
@@ -362,9 +361,10 @@ void process_append_entries_response(Server& server, AppendEntriesResponse appen
     if (unanswered_message->rpc.append_entries.entry_count != 0) {
         if (append_entries_response.success) {
             int next_server_index = unanswered_message->rpc.append_entries.prev_log_index + unanswered_message->rpc.append_entries.entry_count + 1;
-            TraceLog(LOG_INFO, TextFormat("(server %i) received AppendEntries response from server %i. successfull. changing next index from %i to %i", server.id, sender_id, server.next_index[sender_id - 1], next_server_index));
+            int next_match_index = unanswered_message->rpc.append_entries.prev_log_index + unanswered_message->rpc.append_entries.entry_count;
+            TraceLog(LOG_INFO, TextFormat("(server %i) received AppendEntries response from server %i. successfull. changing next index from %i to %i, match index for her is now %i", server.id, sender_id, server.next_index[sender_id - 1], next_server_index, next_match_index));
             server.next_index[sender_id - 1] = next_server_index;
-            server.match_index[sender_id - 1] = unanswered_message->rpc.append_entries.prev_log_index + unanswered_message->rpc.append_entries.entry_count;
+            server.match_index[sender_id - 1] = next_match_index;
         } else {
             TraceLog(LOG_INFO, TextFormat("(server %i) received AppendEntries response from server %i. response was negative. downgrading next index from %i to %i", server.id, sender_id, server.next_index[sender_id - 1], server.next_index[sender_id - 1] - 1));
             server.next_index[sender_id - 1]--;
