@@ -126,6 +126,8 @@ struct Server {
     std::unordered_set<int> votes;
     size_t next_message_id {1};
     std::list<UnansweredMessage> unanswered_messages;
+
+    bool is_down {false};
 };
 
 #define SERVER_COUNT 5
@@ -134,6 +136,8 @@ struct Server {
 #define ELECTION_MIN_TIME 4.0f
 
 static void server_push_log(Server& server, int term, std::string log) {
+    assert(!server.is_down);
+
     TraceLog(LOG_INFO, TextFormat("(server %i) pushing log [%i %s] at index %zu", server.id, server.term, log.c_str(), server.log.size()));
     assert(server.log.size() < LOG_MAX_SIZE);
     server.log.push_back(Log {
@@ -168,10 +172,11 @@ AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append
         server.state = ServerState::Follower;
     }
     server.voted_for = 0;
+    server.votes.clear();
     server.election_timer = ELECTION_MIN_TIME + ELECTION_TIMEOUT * (float)rand() / (float)RAND_MAX;
 
     if (append_entries.term < server.term) {
-        TraceLog(LOG_INFO, "(server %i) received AppendEntries from server %i with old term (my term: %s, her term: %s)", server.id, sender_id, server.term, append_entries.term);
+        TraceLog(LOG_INFO, "(server %i) received AppendEntries from server %i with old term (my term: %i, her term: %i)", server.id, sender_id, server.term, append_entries.term);
         return AppendEntriesResponse { server.term, false, initial_message_id };
     }
 
@@ -235,7 +240,11 @@ RequestVoteResponse answer_request_vote(Server& server, RequestVote request_vote
         response.vote_granted = true;
         response.initial_message_id = initial_message_id;
     } else {
-        TraceLog(LOG_INFO, TextFormat("(server %i) received RequestVote from server %i. log mismatch or voted for someone already", server.id, sender_id));
+        if (server.voted_for != 0 && server.voted_for != request_vote.candidate_id) {
+            TraceLog(LOG_INFO, TextFormat("(server %i) received RequestVote from server %i. already voted for %i", server.id, sender_id, server.voted_for));
+        } else {
+            TraceLog(LOG_INFO, TextFormat("(server %i) received RequestVote from server %i. log mismatch, log terms (me %i, her %i), log indices (me %i, her %i)", server.id, sender_id, server_get_log_term_at_index(server, server_get_last_log_index(server)), request_vote.last_log_term, server_get_last_log_index(server), request_vote.last_log_index));
+        }
         response.term = server.term;
         response.vote_granted = false;
         response.initial_message_id = initial_message_id;
@@ -245,6 +254,9 @@ RequestVoteResponse answer_request_vote(Server& server, RequestVote request_vote
 
 void server_send_rpc(Server& server, RPC rpc) {
     assert(rpc.message_id != 0);
+    if (server.is_down) {
+        return;
+    }
     server.messages.push_back(rpc);
 }
 
@@ -253,6 +265,8 @@ void process_request_vote(Server& server, RequestVote request_vote, size_t messa
             TraceLog(LOG_INFO, TextFormat("(server %i) received RequestVote response from server %i. her term is higher than mine, will become follower", server.id, sender_id));
             server.term = request_vote.term;
             server.state = ServerState::Follower;
+            server.voted_for = 0;
+            server.votes.clear();
         }
         RequestVoteResponse request_vote_response = answer_request_vote(server, request_vote, message_id, sender_id);
         auto s = std::find_if(begin(server.others), end(server.others), [rv = request_vote](Server* s) {
@@ -272,6 +286,8 @@ void process_append_entries(Server& server, AppendEntries append_entries, size_t
         TraceLog(LOG_INFO, TextFormat("(server %i) received RequestVote response from server %i. her term is higher than mine, will become follower", server.id, sender_id));
         server.term = append_entries.term;
         server.state = ServerState::Follower;
+        server.voted_for = 0;
+        server.votes.clear();
     }
 
     if (server.state == ServerState::Candidate) {
@@ -292,17 +308,21 @@ void process_append_entries(Server& server, AppendEntries append_entries, size_t
 }
 
 void process_request_vote_response(Server& server, RequestVoteResponse request_vote_response, size_t message_id, int sender_id) {
-    assert(server.state == ServerState::Candidate || server.state == ServerState::Leader);
+    if (server.state == ServerState::Follower) {
+        return;
+    }
     if (server.term < request_vote_response.term) {
         TraceLog(LOG_INFO, TextFormat("(server %i) received RequestVote response from server %i. her term is higher than mine, will become follower", server.id, sender_id));
         server.term = request_vote_response.term;
         server.state = ServerState::Follower;
+        server.voted_for = 0;
+        server.votes.clear();
     }
 
     if (request_vote_response.vote_granted) {
-        TraceLog(LOG_INFO, TextFormat("(server %i) received RequestVote response from server %i got her vote", server.id, sender_id));
         assert(request_vote_response.term <= server.term);
         server.votes.insert(sender_id);
+        TraceLog(LOG_INFO, TextFormat("(server %i) received RequestVote response from server %i got her vote, vote count is now %i", server.id, sender_id, server.votes.size()));
     }
     if (server.votes.size() * 2 > SERVER_COUNT) {
         // majority of votes, become the leader
@@ -318,15 +338,19 @@ void process_request_vote_response(Server& server, RequestVoteResponse request_v
 }
 
 void process_append_entries_response(Server& server, AppendEntriesResponse append_entries_response, size_t message_id, int sender_id) {
-    assert(server.state == ServerState::Leader);
     assert(append_entries_response.initial_message_id != 0);
     auto unanswered_message = std::find_if(begin(server.unanswered_messages), end(server.unanswered_messages), [&append_entries_response, &sender_id](const UnansweredMessage& msg){return msg.send_to_id == sender_id && msg.id == append_entries_response.initial_message_id;});
     assert(unanswered_message != end(server.unanswered_messages));
+    if (server.state != ServerState::Leader) {
+        goto cleanup;
+    }
 
     if (server.term < append_entries_response.term) {
         TraceLog(LOG_INFO, TextFormat("(server %i) received AppendEntries response from server %i. her term is higher than mine, will become follower", server.id, sender_id));
         server.term = append_entries_response.term;
         server.state = ServerState::Follower;
+        server.voted_for = 0;
+        server.votes.clear();
         goto cleanup;
     }
 
@@ -401,7 +425,11 @@ void update_leader(Server& server, float dt) {
             int next_index = server.next_index[other->id - 1];
             //size_t match_index = server.match_index[other->id - 1];
             if (last_log_index >= next_index) {
-                TraceLog(LOG_INFO, TextFormat("(server %i) server %i has a next index of %i while my last log index is %i, sending entries", server.id, other->id, next_index, last_log_index));
+                if (!other->is_down) {
+                    // in theory, we shouldn't know from here that another
+                    // server is down. this is only to clean the log.
+                    TraceLog(LOG_INFO, TextFormat("(server %i) server %i has a next index of %i while my last log index is %i, sending entries", server.id, other->id, next_index, last_log_index));
+                }
                 assert(next_index > 0);
                 assert(next_index - 1 < (int)server.log.size());
                 AppendEntries append_entries = AppendEntries {
@@ -455,6 +483,7 @@ void update_follower(Server& server, float dt) {
         TraceLog(LOG_INFO, TextFormat("(server %i) election timeout, triggering election", server.id));
         server.term++;
         server.voted_for = server.id;
+        server.votes.insert(server.id);
         server.state = ServerState::Candidate;
         server.election_timer = ELECTION_MIN_TIME + ELECTION_TIMEOUT * (float)rand() / (float)RAND_MAX;
         for (Server* other: server.others) {
@@ -472,7 +501,11 @@ void update_follower(Server& server, float dt) {
 }
 
 void update_server(Server& server, float dt) {
-    if(server.commit_index > server.last_applied) {
+    if (server.is_down) {
+        return;
+    }
+
+    if (server.commit_index > server.last_applied) {
         server.last_applied++;
         // apply server.log[last_applied]
     }
@@ -554,12 +587,28 @@ int main() {
             client_push_log_timer = PUSH_LOG_TIMER * (float)rand() / (float)RAND_MAX;
             auto leader = std::find_if(begin(servers), end(servers), [](Server& s) {
                 // TODO: isn't the real leader the one with max term in case of two leaders ?
-                return s.state == ServerState::Leader;
+                return s.state == ServerState::Leader && !s.is_down;
             });
             if (leader != end(servers)) {
                 server_push_log(*leader, leader->term, "hello");
             }
         }
+
+        if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+            const Vector2 mouse_pos = GetMousePosition();
+            for (int i = 0; i < SERVER_COUNT; ++i) {
+                const int server_x = WINDOW_WIDTH * (i + 1) / (SERVER_COUNT + 1);
+                const int server_y = 50;
+                const int distance_sq = (server_x - mouse_pos.x) * (server_x - mouse_pos.x) + (server_y - mouse_pos.y) * (server_y - mouse_pos.y);
+
+                if (distance_sq < (15.0f * 15.0f)) {
+                    servers[i].is_down = !servers[i].is_down;
+                }
+
+            }
+        }
+
+
 
         for (Server& server: servers) {
             update_server(server, dt);
@@ -570,6 +619,9 @@ int main() {
         for (int i = 0; i < SERVER_COUNT; ++i) {
             const Server& server = servers[i];
             int server_x = WINDOW_WIDTH * (i + 1) / (SERVER_COUNT + 1);
+            if (server.is_down) {
+                DrawCircle(server_x, 50, 12.0f, SRCERY_CYAN);
+            }
             DrawCircle(server_x, 50, 10.0f, server_draw_color(server.state));
             DrawText(TextFormat("%d", server.id), server_x, 80, 15, SRCERY_BRIGHTWHITE);
             DrawText(TextFormat("Term: %d", server.term), server_x, 100, 15, SRCERY_BRIGHTWHITE);
