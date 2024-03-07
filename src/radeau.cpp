@@ -8,6 +8,13 @@
 
 #include <raylib.h>
 
+/*
+ * TODO
+ *     - fix match_index (not committing when server count < 3)
+ *     - gui to display logs, committed or not)
+ *     - network partitions
+ */
+
 #define SRCERY_BLACK Color{28, 27, 25, 255}
 #define SRCERY_RED Color{239, 47, 39, 255}
 #define SRCERY_GREEN Color{81, 159, 80, 255}
@@ -166,8 +173,6 @@ int server_get_log_term_at_index(const Server& server, int index) {
 }
 
 AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append_entries, size_t initial_message_id, int sender_id) {
-    assert(server.state != ServerState::Leader);
-
     if (server.state == ServerState::Candidate) {
         server.state = ServerState::Follower;
     }
@@ -603,6 +608,18 @@ int main() {
 
                 if (distance_sq < (15.0f * 15.0f)) {
                     servers[i].is_down = !servers[i].is_down;
+                    if (servers[i].is_down) {
+                        servers[i].commit_index = 0;
+                        servers[i].last_applied = 0;
+                        for (int j = 0; j < SERVER_COUNT; ++j) {
+                            servers[i].next_index[j] = 1;
+                            servers[i].match_index[j] = 0;
+                        }
+                        servers[i].messages.clear();
+                        servers[i].votes.clear();
+                        servers[i].next_message_id = 1;
+                        servers[i].unanswered_messages.clear();
+                    }
                 }
 
             }
