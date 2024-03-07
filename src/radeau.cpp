@@ -146,6 +146,21 @@ int server_get_last_log_index(const Server& server) {
     return server.log.size();
 }
 
+std::string server_get_log_at_index(const Server& server, int index) {
+    // log index starts at one
+    assert(index >= 1);
+    assert(index - 1 < server.log.size());
+    return server.log[index - 1].log;
+}
+
+// return term 0 if nothing at this index
+int server_get_log_term_at_index(const Server& server, int index) {
+    if (index <= 0) {
+        return 0;
+    }
+    return server.log[index - 1].term;
+}
+
 AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append_entries, size_t initial_message_id, int sender_id) {
     assert(server.state != ServerState::Leader);
 
@@ -165,22 +180,16 @@ AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append
         return AppendEntriesResponse { server.term, false, initial_message_id };
     }
 
-    //if (server.log.size() <= append_entries.prev_log_index - 1) {
-    //    return AppendEntriesResponse { server.term, false, initial_message_id };
+    //if (server_get_last_log_index(server) <= append_entries.prev_log_index) {
+    //    TraceLog(LOG_INFO, "(server %i) received AppendEntries from server %i with log too big (my log index: %i, her log index: %i)", server.id, sender_id, server_get_last_log_index(server), append_entries.prev_log_index);
+    //    return AppendEntriesResponse {server.term, false, initial_message_id};
     //}
-    //Log log = server.log[append_entries.prev_log_index - 1];
-    //if (log.term != append_entries.prev_log_term) {
-    //    return AppendEntriesResponse { server.term, false, initial_message_id };
-    //}
-
-    if (server_get_last_log_index(server) <= append_entries.prev_log_index) {
-        TraceLog(LOG_INFO, "(server %i) received AppendEntries from server %i with log too big (my log index: %zu, her log index: %zu)", server.id, sender_id, server_get_last_log_index(server), append_entries.prev_log_index);
-        return AppendEntriesResponse {server.term, false, initial_message_id};
-    }
-    Log log = server.log[append_entries.prev_log_index];
-    if (log.term != append_entries.prev_log_term) {
-        TraceLog(LOG_INFO, "(server %i) received AppendEntries from server %i with bad previous log term (my log term: %i, her log term: %i)", server.id, sender_id, log.term, append_entries.prev_log_term);
-        return AppendEntriesResponse {server.term, false, initial_message_id};
+    if ((append_entries.prev_log_index - 1) < server.log.size() && (append_entries.prev_log_index - 1) >= 0) {
+        Log log = server.log[append_entries.prev_log_index - 1];
+        if (log.term != append_entries.prev_log_term) {
+            TraceLog(LOG_INFO, "(server %i) received AppendEntries from server %i with bad previous log term (my log term: %i, her log term: %i)", server.id, sender_id, log.term, append_entries.prev_log_term);
+            return AppendEntriesResponse {server.term, false, initial_message_id};
+        }
     }
     for (size_t i = 0; i < append_entries.entry_count; ++i) {
         Log log_to_add = append_entries.entries[i];
@@ -212,7 +221,7 @@ AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append
         if (append_entries.entry_count == 0) {
             server.commit_index = append_entries.leader_commit_index;
         } else {
-            size_t next_commit_index = std::min(append_entries.leader_commit_index, append_entries.entry_count);
+            size_t next_commit_index = std::min(append_entries.leader_commit_index, append_entries.prev_log_index + append_entries.entry_count);
             TraceLog(LOG_INFO, TextFormat("(server %i) setting commit index to %zu", server.id, next_commit_index));
             server.commit_index = next_commit_index;
         }
@@ -310,7 +319,7 @@ void process_request_vote_response(Server& server, RequestVoteResponse request_v
         server.votes.clear();
         server.heartbeat_timer = 0.0f;
         for (int i = 0; i < SERVER_COUNT; ++i) {
-            server.next_index[i] = server.log.size();
+            server.next_index[i] = server_get_last_log_index(server) + 1;
             server.match_index[i] = 0;
         }
     }
@@ -331,12 +340,14 @@ void process_append_entries_response(Server& server, AppendEntriesResponse appen
 
     if (unanswered_message->rpc.append_entries.entry_count != 0) {
         if (append_entries_response.success) {
-            TraceLog(LOG_INFO, TextFormat("(server %i) received AppendEntries response from server %i. successfull. changing next index from %i to %i", server.id, sender_id, server.next_index[sender_id - 1], unanswered_message->rpc.append_entries.prev_log_index + unanswered_message->rpc.append_entries.entry_count + 1));
-            server.next_index[sender_id - 1] = unanswered_message->rpc.append_entries.prev_log_index + unanswered_message->rpc.append_entries.entry_count + 1;
+            int next_server_index = unanswered_message->rpc.append_entries.prev_log_index + unanswered_message->rpc.append_entries.entry_count + 1;
+            TraceLog(LOG_INFO, TextFormat("(server %i) received AppendEntries response from server %i. successfull. changing next index from %i to %i", server.id, sender_id, server.next_index[sender_id - 1], next_server_index));
+            server.next_index[sender_id - 1] = next_server_index;
             server.match_index[sender_id - 1] = unanswered_message->rpc.append_entries.prev_log_index + unanswered_message->rpc.append_entries.entry_count;
         } else {
             TraceLog(LOG_INFO, TextFormat("(server %i) received AppendEntries response from server %i. response was negative. downgrading next index from %i to %i", server.id, sender_id, server.next_index[sender_id - 1], server.next_index[sender_id - 1] - 1));
             server.next_index[sender_id - 1]--;
+            assert(server.next_index[sender_id - 1] > 0);
         }
     }
 
@@ -393,21 +404,20 @@ void update_leader(Server& server, float dt) {
     }
 
     if (server.log.size() != 0) {
-        int last_log_index = server.log.size() - 1;
+        int last_log_index = server_get_last_log_index(server);
         for (Server* other: server.others) {
             int next_index = server.next_index[other->id - 1];
             //size_t match_index = server.match_index[other->id - 1];
             if (last_log_index >= next_index) {
-                TraceLog(LOG_INFO, TextFormat("(server %i) server %i has a next index of %zi while my last log index is %zu, sending entries", server.id, other->id, next_index, last_log_index));
-                //assert(next_index < server.log.size());
-                //assert(next_index > 0);
-                assert(server.log.size() > 0);
+                TraceLog(LOG_INFO, TextFormat("(server %i) server %i has a next index of %i while my last log index is %i, sending entries", server.id, other->id, next_index, last_log_index));
+                assert(next_index > 0);
+                assert(next_index - 1 < server.log.size());
                 AppendEntries append_entries = AppendEntries {
                     server.term,
                     server.id,
                     next_index - 1,
-                    server.log[next_index - 1].term,
-                    &server.log[next_index],
+                    server_get_log_term_at_index(server, next_index - 1),
+                    &server.log[next_index - 1], // log indices start at one
                     (size_t)(last_log_index - next_index + 1),
                     server.commit_index,
                 };
@@ -528,6 +538,7 @@ int main() {
     for (int i = 0; i < SERVER_COUNT; ++i) {
         servers[i].id = i + 1; // ids start at one
         servers[i].election_timer = ELECTION_MIN_TIME + ELECTION_TIMEOUT * (float)rand() / (float)RAND_MAX;
+        servers[i].log = std::vector<Log>();
         servers[i].log.reserve(LOG_MAX_SIZE);
         for (int j = 0; j < SERVER_COUNT; ++j) {
             if (i != j) {
