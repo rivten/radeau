@@ -51,7 +51,7 @@ enum class RPCType {
 struct RequestVote {
     int term;
     int candidate_id;
-    size_t last_log_index;
+    int last_log_index;
     int last_log_term;
 };
 
@@ -69,7 +69,7 @@ struct AppendEntries {
     int prev_log_term;
     Log* entries;
     size_t entry_count;
-    size_t leader_commit_index;
+    int leader_commit_index;
 };
 
 struct AppendEntriesResponse {
@@ -113,8 +113,8 @@ struct Server {
     std::vector<Log> log;
 
     // volatile state
-    size_t commit_index;
-    size_t last_applied;
+    int commit_index;
+    int last_applied;
 
     // volatide leader-only state
     std::vector<int> next_index; // also contains oneself, but ignored
@@ -149,7 +149,7 @@ int server_get_last_log_index(const Server& server) {
 std::string server_get_log_at_index(const Server& server, int index) {
     // log index starts at one
     assert(index >= 1);
-    assert(index - 1 < server.log.size());
+    assert(index - 1 < (int)server.log.size());
     return server.log[index - 1].log;
 }
 
@@ -175,7 +175,7 @@ AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append
         return AppendEntriesResponse { server.term, false, initial_message_id };
     }
 
-    if ((append_entries.prev_log_index - 1) < server.log.size() && (append_entries.prev_log_index - 1) >= 0) {
+    if ((append_entries.prev_log_index - 1) < (int)server.log.size() && (append_entries.prev_log_index - 1) >= 0) {
         Log log = server.log[append_entries.prev_log_index - 1];
         if (log.term != append_entries.prev_log_term) {
             TraceLog(LOG_INFO, "(server %i) received AppendEntries from server %i with bad previous log term (my log term: %i, her log term: %i)", server.id, sender_id, log.term, append_entries.prev_log_term);
@@ -212,7 +212,7 @@ AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append
         if (append_entries.entry_count == 0) {
             server.commit_index = append_entries.leader_commit_index;
         } else {
-            size_t next_commit_index = std::min(append_entries.leader_commit_index, append_entries.prev_log_index + append_entries.entry_count);
+            int next_commit_index = std::min(append_entries.leader_commit_index, append_entries.prev_log_index + (int)append_entries.entry_count);
             TraceLog(LOG_INFO, TextFormat("(server %i) setting commit index to %zu", server.id, next_commit_index));
             assert(next_commit_index >= server.commit_index);
             server.commit_index = next_commit_index;
@@ -403,7 +403,7 @@ void update_leader(Server& server, float dt) {
             if (last_log_index >= next_index) {
                 TraceLog(LOG_INFO, TextFormat("(server %i) server %i has a next index of %i while my last log index is %i, sending entries", server.id, other->id, next_index, last_log_index));
                 assert(next_index > 0);
-                assert(next_index - 1 < server.log.size());
+                assert(next_index - 1 < (int)server.log.size());
                 AppendEntries append_entries = AppendEntries {
                     server.term,
                     server.id,
@@ -462,7 +462,7 @@ void update_follower(Server& server, float dt) {
                 RPCType::RequestVote,
                 server.next_message_id,
                 server.id,
-                RequestVote {server.term, server.id, server.log.size(), server.log.size() == 0 ? 0 : server.log.back().term},
+                RequestVote {server.term, server.id, server_get_last_log_index(server), server_get_log_term_at_index(server, server_get_last_log_index(server))},
             };
             server.next_message_id++;
             server.unanswered_messages.push_back(UnansweredMessage { rpc.message_id, 0.0f, other->id, rpc });
