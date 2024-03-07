@@ -118,7 +118,7 @@ struct Server {
 
     // volatide leader-only state
     std::vector<int> next_index; // also contains oneself, but ignored
-    std::vector<size_t> match_index; // also contains oneself, but ignored
+    std::vector<int> match_index; // also contains oneself, but ignored
 
     // simulation state -- not part of raft
     float heartbeat_timer;
@@ -131,7 +131,7 @@ struct Server {
 #define SERVER_COUNT 5
 
 #define ELECTION_TIMEOUT 10.0f
-#define ELECTION_MIN_TIME 3.0f
+#define ELECTION_MIN_TIME 4.0f
 
 static void server_push_log(Server& server, int term, std::string log) {
     TraceLog(LOG_INFO, TextFormat("(server %i) pushing log [%i %s] at index %zu", server.id, server.term, log.c_str(), server.log.size()));
@@ -170,20 +170,11 @@ AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append
     server.voted_for = 0;
     server.election_timer = ELECTION_MIN_TIME + ELECTION_TIMEOUT * (float)rand() / (float)RAND_MAX;
 
-    if (append_entries.entry_count == 0) {
-        TraceLog(LOG_INFO, "(server %i) received AppendEntries heartbeat from server %i", server.id, sender_id, server.term, append_entries.term);
-        return AppendEntriesResponse { server.term, true, initial_message_id };
-    }
-
     if (append_entries.term < server.term) {
         TraceLog(LOG_INFO, "(server %i) received AppendEntries from server %i with old term (my term: %s, her term: %s)", server.id, sender_id, server.term, append_entries.term);
         return AppendEntriesResponse { server.term, false, initial_message_id };
     }
 
-    //if (server_get_last_log_index(server) <= append_entries.prev_log_index) {
-    //    TraceLog(LOG_INFO, "(server %i) received AppendEntries from server %i with log too big (my log index: %i, her log index: %i)", server.id, sender_id, server_get_last_log_index(server), append_entries.prev_log_index);
-    //    return AppendEntriesResponse {server.term, false, initial_message_id};
-    //}
     if ((append_entries.prev_log_index - 1) < server.log.size() && (append_entries.prev_log_index - 1) >= 0) {
         Log log = server.log[append_entries.prev_log_index - 1];
         if (log.term != append_entries.prev_log_term) {
@@ -196,7 +187,7 @@ AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append
         // checking existing log entry
         size_t log_index = append_entries.prev_log_index + 1 + i;
         if (log_index < server.log.size()) {
-            Log existing_log = server.log[log_index];
+            Log existing_log = server.log[log_index - 1];
             if (existing_log.term != log_to_add.term || existing_log.log != log_to_add.log) {
                 // conflict ! removing everything that follow
                 // TODO: we should assert that nothing is commited
@@ -210,7 +201,7 @@ AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append
         Log log_to_add = append_entries.entries[i];
         size_t log_index = append_entries.prev_log_index + 1 + i;
         if (log_index < server.log.size()) {
-            Log existing_log = server.log[log_index];
+            Log existing_log = server.log[log_index - 1];
             if (existing_log.term == log_to_add.term && existing_log.log == log_to_add.log) {
                 continue;
             }
@@ -223,6 +214,7 @@ AppendEntriesResponse answer_append_entries(Server& server, AppendEntries append
         } else {
             size_t next_commit_index = std::min(append_entries.leader_commit_index, append_entries.prev_log_index + append_entries.entry_count);
             TraceLog(LOG_INFO, TextFormat("(server %i) setting commit index to %zu", server.id, next_commit_index));
+            assert(next_commit_index >= server.commit_index);
             server.commit_index = next_commit_index;
         }
     }
@@ -236,7 +228,7 @@ RequestVoteResponse answer_request_vote(Server& server, RequestVote request_vote
         response.term = server.term;
         response.vote_granted = false;
         response.initial_message_id = initial_message_id;
-    } else if ((server.voted_for == 0 || server.voted_for == request_vote.candidate_id) && (server.log.size() == 0 || request_vote.last_log_term >= server.log.back().term) && (request_vote.last_log_index >= server.log.size())) {
+    } else if ((server.voted_for == 0 || server.voted_for == request_vote.candidate_id) && (request_vote.last_log_term >= server_get_log_term_at_index(server, server_get_last_log_index(server)) && (request_vote.last_log_index >= server_get_last_log_index(server)))) {
         TraceLog(LOG_INFO, TextFormat("(server %i) received RequestVote from server %i. ok to vote for her", server.id, sender_id, server.term, request_vote.term));
         response.term = server.term;
         server.voted_for = request_vote.candidate_id;
@@ -432,15 +424,16 @@ void update_leader(Server& server, float dt) {
             }
         }
     }
-    for (size_t i = server.commit_index + 1; i < server.log.size(); ++i) {
-        int count_commited = 0;
+    for (int i = server.commit_index + 1; i <= server_get_last_log_index(server); ++i) {
+        int count_replicated = 0;
         for (int j = 0; j < SERVER_COUNT; ++j) {
-            if (server.match_index[j] >= i) {
-                count_commited++;
+            if ((j - 1) == server.id || server.match_index[j] >= i) {
+                count_replicated++;
             }
         }
-        if (2 * count_commited > SERVER_COUNT) {
+        if (2 * count_replicated > SERVER_COUNT) {
             TraceLog(LOG_INFO, "(server %i) committing entry %i", server.id, server.commit_index);
+            assert(i >= server.commit_index);
             server.commit_index = i;
         }
     }
