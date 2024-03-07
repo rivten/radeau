@@ -10,8 +10,8 @@
 
 /*
  * TODO
- *     - gui to display logs, committed or not)
- *     - network partitions
+ *     - gui to display logs (committed or not)
+ *     - exponential backoff for sending messages to unreachable nodes ?
  */
 
 #define SRCERY_BLACK Color{28, 27, 25, 255}
@@ -134,6 +134,7 @@ struct Server {
     std::list<UnansweredMessage> unanswered_messages;
 
     bool is_down {false};
+    bool is_in_partition {false};
 };
 
 #define SERVER_COUNT 5
@@ -256,12 +257,15 @@ RequestVoteResponse answer_request_vote(Server& server, RequestVote request_vote
     return response;
 }
 
-void server_send_rpc(Server& server, RPC rpc) {
+void server_send_rpc(const Server& from, Server& to, RPC rpc) {
     assert(rpc.message_id != 0);
-    if (server.is_down) {
+    if (to.is_down) {
         return;
     }
-    server.messages.push_back(rpc);
+    if (from.is_in_partition != to.is_in_partition) {
+        return;
+    }
+    to.messages.push_back(rpc);
 }
 
 void process_request_vote(Server& server, RequestVote request_vote, size_t message_id, int sender_id) {
@@ -282,7 +286,7 @@ void process_request_vote(Server& server, RequestVote request_vote, size_t messa
         response.message_id = server.next_message_id;
         server.next_message_id++;
         response.request_vote_response = request_vote_response;
-        server_send_rpc(**s, response);
+        server_send_rpc(server, **s, response);
 }
 
 void process_append_entries(Server& server, AppendEntries append_entries, size_t message_id, int sender_id) {
@@ -308,7 +312,7 @@ void process_append_entries(Server& server, AppendEntries append_entries, size_t
     auto s = std::find_if(begin(server.others), end(server.others), [sender_id](Server* s) {
         return s->id == sender_id;
     });
-    server_send_rpc(**s, response);
+    server_send_rpc(server, **s, response);
 }
 
 void process_request_vote_response(Server& server, RequestVoteResponse request_vote_response, size_t message_id, int sender_id) {
@@ -420,7 +424,7 @@ void update_leader(Server& server, float dt) {
             rpc.sender_id = server.id;
             rpc.append_entries = append_entries;
             server.unanswered_messages.push_back(UnansweredMessage { rpc.message_id, 0.0f, other->id, rpc });
-            server_send_rpc(*other, rpc);
+            server_send_rpc(server, *other, rpc);
         }
     }
 
@@ -430,7 +434,7 @@ void update_leader(Server& server, float dt) {
             int next_index = server.next_index[other->id - 1];
             //size_t match_index = server.match_index[other->id - 1];
             if (last_log_index >= next_index) {
-                if (!other->is_down) {
+                if (!other->is_down && (other->is_in_partition == server.is_in_partition)) {
                     // in theory, we shouldn't know from here that another
                     // server is down. this is only to clean the log.
                     TraceLog(LOG_INFO, TextFormat("(server %i) server %i has a next index of %i while my last log index is %i, sending entries", server.id, other->id, next_index, last_log_index));
@@ -453,7 +457,7 @@ void update_leader(Server& server, float dt) {
                 server.next_message_id++;
                 server.unanswered_messages.push_back(UnansweredMessage { rpc.message_id, 0.0f, other->id, rpc });
                 rpc.sender_id = server.id;
-                server_send_rpc(*other, rpc);
+                server_send_rpc(server, *other, rpc);
             }
         }
     }
@@ -500,7 +504,7 @@ void update_follower(Server& server, float dt) {
             };
             server.next_message_id++;
             server.unanswered_messages.push_back(UnansweredMessage { rpc.message_id, 0.0f, other->id, rpc });
-            server_send_rpc(*other, rpc);
+            server_send_rpc(server, *other, rpc);
         }
     }
 }
@@ -544,8 +548,11 @@ void update_server(Server& server, float dt) {
     }
 }
 
-static Color server_draw_color(ServerState server_state) {
-    switch (server_state) {
+static Color server_draw_color(const Server& server) {
+    if (server.is_down) {
+        return SRCERY_CYAN;
+    }
+    switch (server.state) {
         case ServerState::Leader: {
             return SRCERY_RED;
         } break;
@@ -619,12 +626,32 @@ int main() {
                         servers[i].votes.clear();
                         servers[i].next_message_id = 1;
                         servers[i].unanswered_messages.clear();
+                        TraceLog(LOG_INFO, TextFormat("(server %i) become down", i + 1));
+                    } else {
+                        TraceLog(LOG_INFO, TextFormat("(server %i) back up", i + 1));
                     }
                 }
 
             }
         }
 
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            const Vector2 mouse_pos = GetMousePosition();
+            for (int i = 0; i < SERVER_COUNT; ++i) {
+                const int server_x = WINDOW_WIDTH * (i + 1) / (SERVER_COUNT + 1);
+                const int server_y = 50;
+                const int distance_sq = (server_x - mouse_pos.x) * (server_x - mouse_pos.x) + (server_y - mouse_pos.y) * (server_y - mouse_pos.y);
+
+                if (distance_sq < (15.0f * 15.0f)) {
+                    servers[i].is_in_partition = !servers[i].is_in_partition;
+                    if (servers[i].is_in_partition) {
+                        TraceLog(LOG_INFO, TextFormat("(server %i) enters partition", i + 1));
+                    } else {
+                        TraceLog(LOG_INFO, TextFormat("(server %i) leaves partition", i + 1));
+                    }
+                }
+            }
+        }
 
 
         for (Server& server: servers) {
@@ -636,10 +663,10 @@ int main() {
         for (int i = 0; i < SERVER_COUNT; ++i) {
             const Server& server = servers[i];
             int server_x = WINDOW_WIDTH * (i + 1) / (SERVER_COUNT + 1);
-            if (server.is_down) {
-                DrawCircle(server_x, 50, 12.0f, SRCERY_CYAN);
+            if (server.is_in_partition) {
+                DrawCircle(server_x, 50, 12.0f, SRCERY_BRIGHTGREEN);
             }
-            DrawCircle(server_x, 50, 10.0f, server_draw_color(server.state));
+            DrawCircle(server_x, 50, 10.0f, server_draw_color(server));
             DrawText(TextFormat("%d", server.id), server_x, 80, 15, SRCERY_BRIGHTWHITE);
             DrawText(TextFormat("Term: %d", server.term), server_x, 100, 15, SRCERY_BRIGHTWHITE);
             DrawText(TextFormat("Voted for: %d", server.voted_for), server_x, 120, 15, SRCERY_BRIGHTWHITE);
